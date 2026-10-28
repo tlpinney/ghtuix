@@ -120,7 +120,7 @@ pub fn jobs(
     Ok((list.jobs, fresh))
 }
 
-fn conditional<T: DeserializeOwned>(
+pub(super) fn conditional<T: DeserializeOwned>(
     client: &Client,
     path: &str,
     saved: Option<Saved>,
@@ -134,7 +134,7 @@ fn conditional<T: DeserializeOwned>(
         (None, Some((_, body))) => (body, None),
         (None, None) => anyhow::bail!("GitHub answered 304 without a saved copy"),
     };
-    let parsed = serde_json::from_str(&body).context("GitHub returned unexpected Actions data")?;
+    let parsed = serde_json::from_str(&body).context("GitHub returned unexpected data")?;
     Ok((parsed, fresh))
 }
 

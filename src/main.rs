@@ -13,6 +13,7 @@ mod local;
 mod log;
 mod markdown;
 mod model;
+mod notifications;
 mod picker;
 mod pr;
 mod time;
@@ -171,6 +172,11 @@ fn etag_what(repo: &str, run_id: Option<i64>) -> String {
     }
 }
 
+/// Where a conditional notifications read keeps its last body and `ETag`.
+fn notifications_what(all: bool) -> String {
+    format!("notifications/{}", if all { "all" } else { "unread" })
+}
+
 /// Adds the saved body and `ETag` to an Actions read, so GitHub can answer `304`.
 fn with_saved(cache: &cache::Cache, host: &str, job: Job) -> Job {
     let Some((login, _)) = cache.get::<String>(&cache::login_key(host)) else {
@@ -185,6 +191,10 @@ fn with_saved(cache: &cache::Cache, host: &str, job: Job) -> Job {
         Job::LoadRuns { repo, .. } => Job::LoadRuns {
             saved: saved(etag_what(&repo, None)),
             repo,
+        },
+        Job::LoadNotifications { all, .. } => Job::LoadNotifications {
+            saved: saved(notifications_what(all)),
+            all,
         },
         Job::LoadJobs { repo, run_id, .. } => Job::LoadJobs {
             saved: saved(etag_what(&repo, Some(run_id))),
@@ -219,6 +229,13 @@ fn save(cache: &cache::Cache, host: &str, message: &Message) {
             result: Ok((_, Some(saved))),
         } => cache.put(
             &cache::etag_key(host, &login, &etag_what(repo, None)),
+            saved,
+        ),
+        Message::Notifications {
+            all,
+            result: Ok((_, Some(saved))),
+        } => cache.put(
+            &cache::etag_key(host, &login, &notifications_what(*all)),
             saved,
         ),
         Message::Jobs {
@@ -286,6 +303,11 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 number,
                 result: client()
                     .and_then(|c| github::history::commits(&c, &repo, number).map_err(text)),
+            },
+            Job::LoadNotifications { all, saved } => Message::Notifications {
+                all,
+                result: client()
+                    .and_then(|c| github::notifications::list(&c, all, saved).map_err(text)),
             },
             Job::LoadChoices { repo, purpose } => Message::Choices {
                 purpose,

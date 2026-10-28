@@ -4,11 +4,13 @@ use crate::actions::{ActionsView, OpenRun};
 use crate::compose::{Compose, Stage, Target};
 use crate::git::{GraphLine, Repo};
 use crate::github::actions::{Job as RunJob, Run, Saved};
+use crate::github::notifications::Notification;
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
 use crate::log::LogView;
 use crate::model::{Event, MergeMethod, PrCommit, PrPage, PullRequest, WriteKind};
+use crate::notifications::NotificationsView;
 use crate::picker::{Item, Picker, Purpose};
 use crate::pr::{Anchor, PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -26,13 +28,15 @@ pub enum View {
     Inbox,
     Local,
     Actions,
+    Notifications,
 }
 
 impl View {
-    const ALL: [(View, char, &'static str); 3] = [
+    const ALL: [(View, char, &'static str); 4] = [
         (View::Inbox, '1', "Inbox"),
         (View::Local, '2', "Local"),
         (View::Actions, '3', "Actions"),
+        (View::Notifications, '4', "Notifications"),
     ];
 }
 
@@ -74,6 +78,11 @@ pub enum Action {
     Merge,
     /// Pick the merge method in the merge preview.
     MergeMethod(MergeMethod),
+    /// Show unread notifications only (`false`) or all of them.
+    NotificationsAll(bool),
+    /// Mark the selected notification read, or done.
+    MarkRead,
+    MarkDone,
     /// Open the PR actions menu (close, draft, title, labels, reviewers).
     PrMenu,
     /// Click on row `i` of the open picker: choose it, or toggle it in a multi picker.
@@ -142,6 +151,10 @@ pub enum Message {
     },
     /// A write finished: the new comment's or review's URL, or why it failed.
     Written(Result<String, String>),
+    Notifications {
+        all: bool,
+        result: Result<(Vec<Notification>, Option<Saved>), String>,
+    },
     /// What a label or reviewer picker offers.
     Choices {
         purpose: Purpose,
@@ -180,6 +193,11 @@ pub enum Job {
     LoadPrTimeline {
         repo: String,
         number: i64,
+    },
+    /// Notification threads; `saved` makes the read conditional.
+    LoadNotifications {
+        all: bool,
+        saved: Option<Saved>,
     },
     /// The repository's labels or assignable users, for a picker.
     LoadChoices {
@@ -227,8 +245,11 @@ pub enum GitOp {
 pub struct App {
     pub view: View,
     pub inbox: Inbox,
-    /// The PR opened from the Inbox, if any.
+    /// The PR opened from the Inbox (or Notifications), if any.
     pub pr: Option<PrView>,
+    /// The view Back returns to from the open PR.
+    pr_from: View,
+    pub notifications: NotificationsView,
     /// A write being composed on the open PR.
     pub compose: Option<Compose>,
     /// A menu or a list of labels or reviewers to choose from.
@@ -256,6 +277,8 @@ impl Default for App {
             view: View::Inbox,
             inbox: Inbox::default(),
             pr: None,
+            pr_from: View::Inbox,
+            notifications: NotificationsView::default(),
             compose: None,
             picker: None,
             local: Local::new(Err("No checkout yet".into())),
@@ -305,6 +328,91 @@ impl App {
                 if view == View::Actions && self.actions.runs.is_none() {
                     self.load_actions();
                 }
+                if view == View::Notifications && self.notifications.items.is_none() {
+                    self.load_notifications();
+                }
+            }
+            Action::NotificationsAll(all) => {
+                if self.notifications.all != all {
+                    self.notifications.all = all;
+                    self.notifications.items = None;
+                    self.notifications.selected = 0;
+                    self.notifications.loading = false;
+                    self.load_notifications();
+                }
+            }
+            Action::Select(index) if self.view == View::Notifications => {
+                if index == self.notifications.selected {
+                    self.dispatch(Action::Open);
+                } else {
+                    self.notifications.select(index);
+                }
+            }
+            Action::Move(delta) if self.view == View::Notifications => {
+                self.notifications.move_selection(delta)
+            }
+            Action::Open if self.view == View::Notifications => {
+                let Some(item) = self.notifications.selected_item() else {
+                    return;
+                };
+                match item.pr_number() {
+                    Some(number) => {
+                        let summary = PullRequest {
+                            repo: item.repository.full_name.clone(),
+                            number,
+                            title: item.subject.title.clone(),
+                            url: item.web_url(),
+                            body: String::new(),
+                            draft: false,
+                            author: crate::model::Person {
+                                login: String::new(),
+                                bot: false,
+                            },
+                            created_at: String::new(),
+                            updated_at: item.updated_at.clone(),
+                            merged_at: None,
+                            queues: Vec::new(),
+                            decision: crate::model::Decision::None,
+                            checks: crate::model::Checks::None,
+                            reviewers: Vec::new(),
+                        };
+                        // The notification's time is not the PR's, so no cached page answers.
+                        self.jobs.push(Job::LoadPr {
+                            repo: summary.repo.clone(),
+                            number,
+                            updated_at: None,
+                        });
+                        self.pr = Some(PrView::new(summary));
+                        self.pr_from = View::Notifications;
+                        self.view = View::Inbox;
+                    }
+                    None => {
+                        self.status = format!("Opening {} on the web", item.subject.title);
+                        self.jobs.push(Job::Open(item.web_url()));
+                    }
+                }
+            }
+            Action::OpenInBrowser if self.view == View::Notifications => {
+                if let Some(item) = self.notifications.selected_item() {
+                    self.jobs.push(Job::Open(item.web_url()));
+                }
+            }
+            Action::MarkRead | Action::MarkDone => {
+                let Some(item) = self.notifications.selected_item() else {
+                    return;
+                };
+                let thread_id = item.id.clone();
+                let kind = if action == Action::MarkRead {
+                    if !item.unread {
+                        self.status = "That notification is already read".into();
+                        return;
+                    }
+                    WriteKind::MarkRead { thread_id }
+                } else {
+                    WriteKind::MarkDone { thread_id }
+                };
+                let target = Target::run(&item.repository.full_name, &item.subject.title);
+                self.compose = Some(Compose::new(kind, target));
             }
             Action::LocalTab(tab) => {
                 self.local.tab = tab;
@@ -590,7 +698,11 @@ impl App {
                     self.pr = Some(PrView::new(pr));
                 }
             }
-            Action::Back => self.pr = None,
+            Action::Back => {
+                if self.pr.take().is_some() {
+                    self.view = std::mem::replace(&mut self.pr_from, View::Inbox);
+                }
+            }
             Action::Compose(kind) => match self.pr.as_ref().and_then(|pr| pr.page.as_ref()) {
                 Some(page) => {
                     let mut compose = Compose::new(kind, Target::of(page));
@@ -678,6 +790,8 @@ impl App {
             Action::Refresh => {
                 if self.view == View::Actions {
                     self.load_actions();
+                } else if self.view == View::Notifications {
+                    self.load_notifications();
                 } else if self.view == View::Inbox
                     && let Some(pr) = &mut self.pr
                 {
@@ -858,6 +972,17 @@ impl App {
                     saved: None,
                 });
             }
+        }
+    }
+
+    /// Reads the notifications again, unless a read is running.
+    fn load_notifications(&mut self) {
+        if !self.notifications.loading {
+            self.notifications.loading = true;
+            self.jobs.push(Job::LoadNotifications {
+                all: self.notifications.all,
+                saved: None,
+            });
         }
     }
 
@@ -1058,6 +1183,13 @@ impl App {
                 if let Some(compose) = &mut self.compose {
                     compose.stage = Stage::Preview;
                     compose.error = Some(error);
+                }
+            }
+            Message::Notifications { all, result } => {
+                if all == self.notifications.all {
+                    self.notifications.loading = false;
+                    self.notifications.items = Some(result.map(|(items, _)| items));
+                    self.notifications.move_selection(0);
                 }
             }
             Message::Choices { purpose, result } => {
@@ -1296,6 +1428,29 @@ impl App {
                     .iter()
                     .map(|(tab, key, _)| Control::hidden(KeyCode::Char(*key), Action::Tab(*tab))),
             );
+        } else if self.view == View::Notifications {
+            controls.push(Control::new(KeyCode::Enter, "Open", Action::Open));
+            controls.push(Control::new(
+                KeyCode::Char('x'),
+                "Mark read",
+                Action::MarkRead,
+            ));
+            controls.push(Control::new(KeyCode::Char('D'), "Done", Action::MarkDone));
+            let (key, label, all) = if self.notifications.all {
+                ('u', "Unread only", false)
+            } else {
+                ('a', "All", true)
+            };
+            controls.push(Control::new(
+                KeyCode::Char(key),
+                label,
+                Action::NotificationsAll(all),
+            ));
+            controls.push(Control::new(
+                KeyCode::Char('w'),
+                "Web",
+                Action::OpenInBrowser,
+            ));
         } else if self.view == View::Actions {
             if self.actions.open.is_some() {
                 controls.push(Control::new(KeyCode::Enter, "Log", Action::Open));
@@ -1380,6 +1535,7 @@ impl App {
             },
             (View::Local, None) => self.local.draw(frame, body),
             (View::Actions, None) => self.actions.draw(frame, body),
+            (View::Notifications, None) => self.notifications.draw(frame, body),
         };
         let note = self
             .api_note
@@ -2236,5 +2392,138 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.picker.is_none());
         assert!(app.pr.is_some(), "Esc closes only the picker");
+    }
+
+    fn with_notifications() -> App {
+        use crate::notifications::tests::notification;
+        let mut app = signed_in();
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(
+            app.jobs,
+            vec![Job::LoadNotifications {
+                all: false,
+                saved: None
+            }]
+        );
+        app.receive(Message::Notifications {
+            all: false,
+            result: Ok((
+                vec![
+                    notification("t1", "PullRequest", 7),
+                    notification("t2", "Issue", 8),
+                ],
+                None,
+            )),
+        });
+        app.jobs.clear();
+        app
+    }
+
+    #[test]
+    fn a_pr_notification_opens_the_pr_and_back_returns_to_notifications() {
+        for by_click in [false, true] {
+            let mut app = with_notifications();
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("Notifications · unread"), "{screen}");
+            assert!(screen.contains("Subject t1") && screen.contains("review requested"));
+            if by_click {
+                click(&mut app, &Action::Select(0)); // the selected row opens
+            } else {
+                press(&mut app, KeyCode::Enter);
+            }
+            assert_eq!(app.view, View::Inbox);
+            assert!(matches!(
+                &app.jobs[..],
+                [Job::LoadPr { repo, number: 7, updated_at: None }] if repo == "o/a"
+            ));
+            press(&mut app, KeyCode::Esc);
+            assert!(app.pr.is_none());
+            assert_eq!(app.view, View::Notifications);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view, View::Notifications, "a second Back stays put");
+        }
+    }
+
+    #[test]
+    fn other_notifications_open_on_the_web() {
+        let mut app = with_notifications();
+        draw(&mut app, 140);
+        click(&mut app, &Action::Select(1));
+        assert!(app.jobs.is_empty(), "the first click selects");
+        click(&mut app, &Action::Select(1));
+        assert_eq!(
+            app.jobs,
+            vec![Job::Open("https://github.com/o/a/issues/8".into())]
+        );
+    }
+
+    #[test]
+    fn marking_read_or_done_previews_then_reloads() {
+        for (key, action) in [('x', Action::MarkRead), ('D', Action::MarkDone)] {
+            for by_click in [false, true] {
+                let mut app = with_notifications();
+                draw(&mut app, 140);
+                if by_click {
+                    click(&mut app, &action);
+                } else {
+                    press(&mut app, KeyCode::Char(key));
+                }
+                let screen = draw(&mut app, 140).join("\n");
+                assert!(screen.contains("the notification in o/a"), "{screen}");
+                assert!(screen.contains("Subject t1"), "{screen}");
+                assert!(app.jobs.is_empty(), "nothing is sent before confirming");
+                press(&mut app, KeyCode::Enter);
+                let thread = match &app.jobs[..] {
+                    [
+                        Job::Write {
+                            kind:
+                                WriteKind::MarkRead { thread_id } | WriteKind::MarkDone { thread_id },
+                            ..
+                        },
+                    ] => thread_id.clone(),
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(thread, "t1");
+                app.jobs.clear();
+                app.receive(Message::Written(Ok("marked".into())));
+                assert!(
+                    app.jobs.contains(&Job::LoadNotifications {
+                        all: false,
+                        saved: None
+                    }),
+                    "{:?}",
+                    app.jobs
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_and_unread_switch_by_key_and_click() {
+        let mut app = with_notifications();
+        draw(&mut app, 140);
+        click(&mut app, &Action::NotificationsAll(true));
+        assert!(app.notifications.all && app.notifications.items.is_none());
+        assert_eq!(
+            app.jobs,
+            vec![Job::LoadNotifications {
+                all: true,
+                saved: None
+            }]
+        );
+        // A late answer for the other list is ignored.
+        app.receive(Message::Notifications {
+            all: false,
+            result: Ok((Vec::new(), None)),
+        });
+        assert!(app.notifications.items.is_none());
+        app.jobs.clear();
+        press(&mut app, KeyCode::Char('u'));
+        assert!(!app.notifications.all);
+        assert!(
+            draw(&mut app, 140)
+                .join("\n")
+                .contains("Loading notifications")
+        );
     }
 }

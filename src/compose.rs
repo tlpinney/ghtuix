@@ -119,6 +119,8 @@ impl Compose {
             WriteKind::Commit { branch, files, .. } => {
                 format!("Commit {} staged file(s) on {branch} in", files.len())
             }
+            WriteKind::MarkRead { .. } => "Mark read the notification in".into(),
+            WriteKind::MarkDone { .. } => "Mark done (leaves the inbox) the notification in".into(),
             WriteKind::Close => "Close".into(),
             WriteKind::Reopen => "Reopen".into(),
             WriteKind::ToDraft => "Convert to a draft".into(),

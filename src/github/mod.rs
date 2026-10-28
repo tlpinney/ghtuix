@@ -13,6 +13,7 @@ pub mod budget;
 pub mod choices;
 pub mod history;
 pub mod inbox;
+pub mod notifications;
 pub mod pr;
 pub mod viewer;
 pub mod write;
@@ -127,6 +128,13 @@ impl Client {
             .map(|_| ())
     }
 
+    /// A REST write of `method` (`PATCH` or `DELETE`) with no body.
+    pub fn rest_write(&self, method: &str, path: &str) -> Result<()> {
+        let _turn = self.gate.write_turn();
+        self.rest(method, path, "application/vnd.github+json", None)
+            .map(|_| ())
+    }
+
     /// A REST write of `method` (`POST` or `DELETE`) with a JSON body.
     pub fn rest_json(&self, method: &str, path: &str, body: &serde_json::Value) -> Result<()> {
         let _turn = self.gate.write_turn();
@@ -168,12 +176,22 @@ impl Client {
                 .header("Authorization", &auth)
                 .header("Accept", accept)
                 .send_json(body)
-        } else if method == "POST" {
-            self.agent
-                .post(&url)
+        } else if method == "POST" || method == "PATCH" {
+            let request = if method == "PATCH" {
+                self.agent.patch(&url)
+            } else {
+                self.agent.post(&url)
+            };
+            request
                 .header("Authorization", &auth)
                 .header("Accept", accept)
                 .send_empty()
+        } else if method == "DELETE" {
+            self.agent
+                .delete(&url)
+                .header("Authorization", &auth)
+                .header("Accept", accept)
+                .call()
         } else {
             let mut request = self
                 .agent

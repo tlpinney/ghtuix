@@ -121,6 +121,13 @@ pub enum WriteKind {
         run_id: i64,
         run: String,
     },
+    /// Mark a notification thread read, or done (gone from the inbox).
+    MarkRead {
+        thread_id: String,
+    },
+    MarkDone {
+        thread_id: String,
+    },
     Close,
     Reopen,
     ToDraft,
@@ -164,6 +171,8 @@ impl WriteKind {
             Self::Rerun { run, .. } => format!("Re-run failed jobs of {run}"),
             Self::CancelRun { run, .. } => format!("Cancel {run}"),
             Self::Commit { branch, .. } => format!("Commit on {branch}"),
+            Self::MarkRead { .. } => "Mark read".into(),
+            Self::MarkDone { .. } => "Mark done".into(),
             Self::Close => "Close".into(),
             Self::Reopen => "Reopen".into(),
             Self::ToDraft => "Convert to draft".into(),
@@ -182,6 +191,8 @@ impl WriteKind {
                 | Self::Merge { .. }
                 | Self::Rerun { .. }
                 | Self::CancelRun { .. }
+                | Self::MarkRead { .. }
+                | Self::MarkDone { .. }
                 | Self::Close
                 | Self::Reopen
                 | Self::ToDraft

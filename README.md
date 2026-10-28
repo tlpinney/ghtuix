@@ -25,7 +25,7 @@ ghtuix
 Every control on screen is clickable and shows its key. Writes always show a preview of
 exactly what will happen and wait for **Enter** to confirm; **Esc** steps back.
 
-**Everywhere:** `1` Inbox, `2` Local, `3` Actions · `r` refresh · `q` quit ·
+**Everywhere:** `1` Inbox, `2` Local, `3` Actions, `4` Notifications · `r` refresh · `q` quit ·
 `↑/↓` or `j/k` move · PgUp/PgDn and the wheel scroll.
 
 ### 1 Inbox
@@ -72,6 +72,15 @@ Browsing never changes the checkout: git runs with `--no-optional-locks`, so eve
 | `R` `C` | Re-run the failed jobs · cancel the run |
 | `w` | Open the run on GitHub |
 
+### 4 Notifications
+
+| Key | Action |
+| --- | --- |
+| `Enter` / click a selected row | Open a PR notification in the PR view (Back returns here); others open on the web |
+| `x` `D` | Mark the notification read · mark it done (it leaves GitHub's inbox) |
+| `a` / `u` | Show all notifications · only unread ones |
+| `w` | Open on GitHub |
+
 ## Configuration
 
 `~/.config/ghtuix/config.toml` (or `$XDG_CONFIG_HOME/ghtuix/config.toml`):
@@ -87,7 +96,8 @@ excluded_repositories = ["owner/noisy"]   # never shown in the Inbox
   the local cache at start, then refreshes every minute.
 - A PR page is one request, skipped entirely when the PR has not changed since it was
   cached; diffs between two commits and finished job logs are cached for good.
-- Actions lists are conditional reads: an unchanged list costs nothing (`304`).
+- Actions and notification lists are conditional reads: an unchanged list costs nothing
+  (`304`).
 - When GitHub's budget runs low, automatic refresh slows down and then pauses until the
   reset; the status line says so.
 

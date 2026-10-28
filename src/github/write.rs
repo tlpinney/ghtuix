@@ -148,6 +148,12 @@ pub fn publish(
             .filter(|thread| !thread.is_resolved)
             .map(|_| "thread unresolved".to_string())
             .ok_or_else(missing),
+        WriteKind::MarkRead { thread_id } => {
+            super::notifications::mark_read(client, thread_id).map(|()| "marked read".to_string())
+        }
+        WriteKind::MarkDone { thread_id } => {
+            super::notifications::mark_done(client, thread_id).map(|()| "marked done".to_string())
+        }
         WriteKind::Close => client
             .mutate::<ClosePr>(close_pr::Variables { pr: pr_id.into() })?
             .close_pull_request
