@@ -59,6 +59,29 @@ pub enum Side {
     Right,
 }
 
+/// How a pull request is merged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub const ALL: [(MergeMethod, char, &'static str); 3] = [
+        (MergeMethod::Merge, 'm', "Merge commit"),
+        (MergeMethod::Squash, 's', "Squash"),
+        (MergeMethod::Rebase, 'r', "Rebase"),
+    ];
+
+    pub fn label(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(m, ..)| *m == self)
+            .map_or("", |(_, _, label)| label)
+    }
+}
+
 /// What a write does to a pull request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteKind {
@@ -82,6 +105,10 @@ pub enum WriteKind {
         place: String,
         resolve: bool,
     },
+    /// Merge the pull request (only if its head is still the one viewed).
+    Merge {
+        method: MergeMethod,
+    },
 }
 
 impl WriteKind {
@@ -96,17 +123,21 @@ impl WriteKind {
                 let verb = if *resolve { "Resolve" } else { "Unresolve" };
                 format!("{verb} the thread on {place}")
             }
+            Self::Merge { method } => format!("Merge ({})", method.label().to_lowercase()),
         }
     }
 
     /// Whether the write has text at all (resolving a thread has none).
     pub fn has_text(&self) -> bool {
-        !matches!(self, Self::Resolve { .. })
+        !matches!(self, Self::Resolve { .. } | Self::Merge { .. })
     }
 
     /// Whether the text may be empty (an approval needs no words).
     pub fn body_optional(&self) -> bool {
-        matches!(self, Self::Approve | Self::Resolve { .. })
+        matches!(
+            self,
+            Self::Approve | Self::Resolve { .. } | Self::Merge { .. }
+        )
     }
 }
 
@@ -233,6 +264,10 @@ pub struct PrPage {
     pub changed_files: i64,
     /// `mergeable`, `conflicting` or `unknown`.
     pub mergeable: String,
+    /// GitHub's merge state: `clean`, `blocked`, `behind`, `dirty`, `unstable`, …
+    pub merge_state: String,
+    /// The merge methods the repository allows.
+    pub merge_methods: Vec<MergeMethod>,
     pub decision: Decision,
     /// Comments and reviews, oldest first.
     pub conversation: Vec<Entry>,

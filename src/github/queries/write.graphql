@@ -39,6 +39,16 @@ mutation AddLineComment(
   }
 }
 
+# Refused by GitHub when the head is no longer `$head` (someone pushed after the preview).
+mutation MergePr($pr: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) {
+  mergePullRequest(input: { pullRequestId: $pr, mergeMethod: $method, expectedHeadOid: $head }) {
+    pullRequest {
+      url
+      merged
+    }
+  }
+}
+
 mutation ReplyToThread($thread: ID!, $body: String!) {
   addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $thread, body: $body }) {
     comment {

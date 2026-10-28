@@ -1,7 +1,9 @@
 //! A pull request page (one GraphQL query) and its diff (REST, by commit SHAs).
 
 use super::Client;
-use crate::model::{Check, Checks, Decision, Entry, FileChange, Person, Stance, Thread};
+use crate::model::{
+    Check, Checks, Decision, Entry, FileChange, MergeMethod, Person, Stance, Thread,
+};
 use anyhow::{Result, anyhow};
 use graphql_client::GraphQLQuery;
 
@@ -31,11 +33,21 @@ pub fn page(client: &Client, repo: &str, number: i64) -> Result<crate::model::Pr
         name: name.into(),
         number,
     })?;
-    let pr = data
+    let repository = data
         .repository
-        .and_then(|repository| repository.pull_request)
+        .ok_or_else(|| anyhow!("{repo} is not visible to this account"))?;
+    let methods = [
+        (repository.merge_commit_allowed, MergeMethod::Merge),
+        (repository.squash_merge_allowed, MergeMethod::Squash),
+        (repository.rebase_merge_allowed, MergeMethod::Rebase),
+    ]
+    .into_iter()
+    .filter_map(|(allowed, method)| allowed.then_some(method))
+    .collect();
+    let pr = repository
+        .pull_request
         .ok_or_else(|| anyhow!("{repo}#{number} is not visible to this account"))?;
-    Ok(convert(repo, pr))
+    Ok(convert(repo, pr, methods))
 }
 
 /// The unified diff from `base` to `head` (commit SHAs, so it never changes).
@@ -54,7 +66,11 @@ fn person(login: String, bot: bool) -> Person {
     Person { login, bot }
 }
 
-fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage {
+fn convert(
+    repo: &str,
+    pr: PrPageRepositoryPullRequest,
+    merge_methods: Vec<MergeMethod>,
+) -> crate::model::PrPage {
     let author = pr.author.map_or_else(
         || person("ghost".into(), false),
         |a| {
@@ -166,6 +182,8 @@ fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage 
         deletions: pr.deletions,
         changed_files: pr.changed_files,
         mergeable: format!("{:?}", pr.mergeable).to_lowercase(),
+        merge_state: format!("{:?}", pr.merge_state_status).to_lowercase(),
+        merge_methods,
         decision,
         conversation,
         threads,

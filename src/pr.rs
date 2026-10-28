@@ -393,6 +393,11 @@ pub(crate) mod tests {
             deletions: 1,
             changed_files: 1,
             mergeable: "mergeable".into(),
+            merge_state: "clean".into(),
+            merge_methods: vec![
+                crate::model::MergeMethod::Merge,
+                crate::model::MergeMethod::Squash,
+            ],
             decision: Decision::None,
             conversation: vec![Entry {
                 author: person("coderabbitai", true),

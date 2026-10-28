@@ -1,7 +1,7 @@
 //! Writes to a pull request: comments, reviews, line comments, replies and resolving.
 
 use super::Client;
-use crate::model::{Side, WriteKind};
+use crate::model::{MergeMethod, Side, WriteKind};
 use anyhow::{Result, anyhow};
 use graphql_client::GraphQLQuery;
 
@@ -25,6 +25,7 @@ macro_rules! mutation {
 mutation!(AddComment);
 mutation!(AddReview);
 mutation!(AddLineComment);
+mutation!(MergePr);
 mutation!(ReplyToThread);
 mutation!(ResolveThread);
 mutation!(UnresolveThread);
@@ -92,6 +93,21 @@ pub fn publish(
             .add_pull_request_review_thread_reply
             .and_then(|added| added.comment)
             .map(|comment| comment.url)
+            .ok_or_else(missing),
+        WriteKind::Merge { method } => client
+            .mutate::<MergePr>(merge_pr::Variables {
+                pr: pr_id.into(),
+                method: match method {
+                    MergeMethod::Merge => merge_pr::PullRequestMergeMethod::MERGE,
+                    MergeMethod::Squash => merge_pr::PullRequestMergeMethod::SQUASH,
+                    MergeMethod::Rebase => merge_pr::PullRequestMergeMethod::REBASE,
+                },
+                head: head_oid.into(),
+            })?
+            .merge_pull_request
+            .and_then(|done| done.pull_request)
+            .filter(|pr| pr.merged)
+            .map(|pr| pr.url)
             .ok_or_else(missing),
         WriteKind::Resolve {
             thread_id,

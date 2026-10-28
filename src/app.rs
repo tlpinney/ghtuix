@@ -5,7 +5,7 @@ use crate::git::{GraphLine, Repo};
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
-use crate::model::{PrPage, PullRequest, WriteKind};
+use crate::model::{MergeMethod, PrPage, PullRequest, WriteKind};
 use crate::pr::{Anchor, PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -48,6 +48,10 @@ pub enum Action {
     ReplyThread,
     /// Resolve or unresolve the thread under the cursor.
     ToggleResolve,
+    /// Start a merge of the open PR.
+    Merge,
+    /// Pick the merge method in the merge preview.
+    MergeMethod(MergeMethod),
     LocalTab(LocalTab),
     /// Start writing a comment or review on the open PR.
     Compose(WriteKind),
@@ -217,6 +221,40 @@ impl App {
                     } else {
                         pr.cursor = index;
                     }
+                }
+            }
+            Action::Merge => {
+                let Some(page) = self.pr.as_ref().and_then(|pr| pr.page.as_ref()) else {
+                    self.status = "Wait for the PR to load before merging".into();
+                    return;
+                };
+                let refusal = if page.state != "open" {
+                    Some(format!(
+                        "This PR is {}; there is nothing to merge",
+                        page.state
+                    ))
+                } else if page.draft {
+                    Some("A draft PR cannot be merged; mark it ready for review first".into())
+                } else if page.merge_methods.is_empty() {
+                    Some("This repository allows no merge method".into())
+                } else {
+                    None
+                };
+                match refusal {
+                    Some(reason) => self.status = reason,
+                    None => {
+                        let method = page.merge_methods[0];
+                        let target = Target::of(page);
+                        self.compose = Some(Compose::new(WriteKind::Merge { method }, target));
+                    }
+                }
+            }
+            Action::MergeMethod(method) => {
+                if let Some(compose) = &mut self.compose
+                    && matches!(compose.kind, WriteKind::Merge { .. })
+                    && compose.target.merge_methods.contains(&method)
+                {
+                    compose.kind = WriteKind::Merge { method };
                 }
             }
             Action::CommentLine | Action::ReplyThread | Action::ToggleResolve => {
@@ -443,12 +481,15 @@ impl App {
                 }
             }
             Message::Written(Ok(url)) => {
-                let kind = self
-                    .compose
-                    .take()
-                    .map_or("Write".into(), |c| c.kind.label());
-                self.status = format!("{kind} published: {url}");
+                let kind = self.compose.take().map(|c| c.kind);
+                let label = kind.as_ref().map_or("Write".into(), WriteKind::label);
+                self.status = format!("{label} published: {url}");
                 self.dispatch(Action::Refresh);
+                if matches!(kind, Some(WriteKind::Merge { .. })) {
+                    // The PR leaves the open queues and joins the merged list.
+                    self.inbox.merged = Default::default();
+                    self.load(Job::LoadInbox);
+                }
             }
             Message::Written(Err(error)) => {
                 // The text stays so nothing typed is lost.
@@ -489,6 +530,14 @@ impl App {
                     None
                 }
                 (Stage::Preview, KeyCode::Enter) => Some(Action::ComposeConfirm),
+                (Stage::Preview, KeyCode::Char(key))
+                    if matches!(compose.kind, WriteKind::Merge { .. }) =>
+                {
+                    MergeMethod::ALL
+                        .iter()
+                        .find(|(_, k, _)| *k == key)
+                        .map(|(method, ..)| Action::MergeMethod(*method))
+                }
                 (Stage::Preview, KeyCode::Char('s')) if ctrl => Some(Action::ComposeConfirm),
                 (Stage::Preview, KeyCode::Esc) => Some(Action::ComposeEdit),
                 _ => None,
@@ -565,6 +614,7 @@ impl App {
                 "Request changes",
                 Action::Compose(WriteKind::RequestChanges),
             ));
+            controls.push(Control::new(KeyCode::Char('M'), "Merge", Action::Merge));
             match self.pr.as_ref().and_then(|pr| Some((pr.tab, pr.anchor()?))) {
                 Some((PrTab::Files, Anchor::Line(_))) => controls.insert(
                     0,
@@ -972,6 +1022,53 @@ mod tests {
             &app.jobs[..],
             [Job::Write { kind: WriteKind::Resolve { resolve: true, .. }, body, .. }] if body.is_empty()
         ));
+    }
+
+    #[test]
+    fn a_merge_previews_method_base_and_head_and_refuses_drafts() {
+        for by_click in [false, true] {
+            let mut app = open_pr(PrTab::Summary);
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::Merge);
+            } else {
+                press(&mut app, KeyCode::Char('M'));
+            }
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(
+                screen.contains("Merge o/a#1 into main by merge commit"),
+                "{screen}"
+            );
+            assert!(screen.contains("GitHub merge state: clean"), "{screen}");
+            assert!(
+                !screen.contains("r Rebase"),
+                "only the repository's methods: {screen}"
+            );
+            if by_click {
+                click(&mut app, &Action::MergeMethod(MergeMethod::Squash));
+            } else {
+                press(&mut app, KeyCode::Char('s'));
+            }
+            press(&mut app, KeyCode::Char('r')); // not allowed here: ignored
+            assert!(draw(&mut app, 140).join("\n").contains("by squash"));
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(
+                &app.jobs[..],
+                [Job::Write { kind: WriteKind::Merge { method: MergeMethod::Squash }, head_oid, .. }]
+                    if *head_oid == "a".repeat(40)
+            ));
+            app.jobs.clear();
+            app.receive(Message::Written(Ok("https://github.com/o/a/pull/1".into())));
+            assert!(
+                app.jobs.contains(&Job::LoadInbox),
+                "the Inbox reloads after a merge"
+            );
+        }
+        let mut draft = open_pr(PrTab::Summary);
+        draft.pr.as_mut().unwrap().page.as_mut().unwrap().draft = true;
+        press(&mut draft, KeyCode::Char('M'));
+        assert!(draft.compose.is_none());
+        assert!(draft.status.contains("draft"), "{}", draft.status);
     }
 
     #[test]

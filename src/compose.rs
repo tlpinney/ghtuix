@@ -2,7 +2,7 @@
 
 use crate::app::Action;
 use crate::editor::Editor;
-use crate::model::{PrPage, WriteKind};
+use crate::model::{MergeMethod, PrPage, WriteKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -25,6 +25,9 @@ pub struct Target {
     pub title: String,
     pub pr_id: String,
     pub head_oid: String,
+    pub base_ref: String,
+    pub merge_state: String,
+    pub merge_methods: Vec<MergeMethod>,
 }
 
 impl Target {
@@ -34,6 +37,9 @@ impl Target {
             title: page.title.clone(),
             pr_id: page.id.clone(),
             head_oid: page.head_oid.clone(),
+            base_ref: page.base_ref.clone(),
+            merge_state: page.merge_state.clone(),
+            merge_methods: page.merge_methods.clone(),
         }
     }
 }
@@ -92,6 +98,7 @@ impl Compose {
                 let verb = if *resolve { "Resolve" } else { "Unresolve" };
                 format!("{verb} the review thread on {place} of")
             }
+            WriteKind::Merge { .. } => "Merge".into(),
         };
         let short = self.target.head_oid.chars().take(12).collect::<String>();
         let mut lines = vec![
@@ -102,7 +109,24 @@ impl Compose {
             Line::raw(self.target.title.clone()),
             Line::raw(format!("As @{login}")),
         ];
-        if matches!(
+        if let WriteKind::Merge { method } = &self.kind {
+            lines[0] = Line::styled(
+                format!(
+                    "Merge {} into {} by {}",
+                    self.target.reference,
+                    self.target.base_ref,
+                    method.label().to_lowercase()
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            );
+            lines.push(Line::raw(format!(
+                "GitHub merge state: {}",
+                self.target.merge_state
+            )));
+            lines.push(Line::raw(format!(
+                "Only if the head is still {short}; GitHub refuses if anyone pushed since."
+            )));
+        } else if matches!(
             self.kind,
             WriteKind::Approve | WriteKind::RequestChanges | WriteKind::LineComment { .. }
         ) {
@@ -152,6 +176,26 @@ impl Compose {
         if let Some(message) = &self.error {
             frame.render_widget(Paragraph::new(message.clone()), error);
         }
+        // A merge offers the repository's allowed methods before its confirm button.
+        let methods: Vec<(String, Action)> = match &self.kind {
+            WriteKind::Merge { method } if self.stage == Stage::Preview => self
+                .target
+                .merge_methods
+                .iter()
+                .map(|candidate| {
+                    let (_, key, label) = MergeMethod::ALL
+                        .into_iter()
+                        .find(|(m, ..)| m == candidate)
+                        .unwrap();
+                    let mark = if candidate == method { "●" } else { "○" };
+                    (
+                        format!("{mark} {key} {label}"),
+                        Action::MergeMethod(*candidate),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let choices: &[(&str, Action)] = match self.stage {
             Stage::Editing => &[
                 ("Ctrl-S Preview", Action::ComposePreview),
@@ -173,7 +217,15 @@ impl Compose {
         if self.stage == Stage::Sending {
             spans.push(Span::raw("Sending…"));
         }
-        for (label, action) in choices {
+        let owned: Vec<(String, Action)> = methods
+            .into_iter()
+            .chain(
+                choices
+                    .iter()
+                    .map(|(label, action)| (label.to_string(), action.clone())),
+            )
+            .collect();
+        for (label, action) in &owned {
             let text = format!("[{label}]");
             let width = text.chars().count() as u16;
             hits.push((Rect::new(at, buttons.y, width, 1), action.clone()));

@@ -1,6 +1,9 @@
 # One pull request page: everything the PR view shows except the diff text.
 query PrPage($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
+    mergeCommitAllowed
+    squashMergeAllowed
+    rebaseMergeAllowed
     pullRequest(number: $number) {
       id
       number
@@ -24,6 +27,7 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
       deletions
       changedFiles
       mergeable
+      mergeStateStatus
       reviewDecision
       comments(first: 100) {
         nodes {
