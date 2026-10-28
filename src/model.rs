@@ -109,6 +109,18 @@ pub enum WriteKind {
     Merge {
         method: MergeMethod,
     },
+    /// Re-run the failed jobs of a workflow run (`run` names it, such as `CI #12`).
+    Rerun {
+        repo: String,
+        run_id: i64,
+        run: String,
+    },
+    /// Cancel a queued or running workflow run.
+    CancelRun {
+        repo: String,
+        run_id: i64,
+        run: String,
+    },
 }
 
 impl WriteKind {
@@ -124,20 +136,22 @@ impl WriteKind {
                 format!("{verb} the thread on {place}")
             }
             Self::Merge { method } => format!("Merge ({})", method.label().to_lowercase()),
+            Self::Rerun { run, .. } => format!("Re-run failed jobs of {run}"),
+            Self::CancelRun { run, .. } => format!("Cancel {run}"),
         }
     }
 
     /// Whether the write has text at all (resolving a thread has none).
     pub fn has_text(&self) -> bool {
-        !matches!(self, Self::Resolve { .. } | Self::Merge { .. })
+        !matches!(
+            self,
+            Self::Resolve { .. } | Self::Merge { .. } | Self::Rerun { .. } | Self::CancelRun { .. }
+        )
     }
 
     /// Whether the text may be empty (an approval needs no words).
     pub fn body_optional(&self) -> bool {
-        matches!(
-            self,
-            Self::Approve | Self::Resolve { .. } | Self::Merge { .. }
-        )
+        self == &Self::Approve || !self.has_text()
     }
 }
 

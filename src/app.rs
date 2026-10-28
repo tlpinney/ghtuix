@@ -1,7 +1,9 @@
 //! Application state and the one dispatch path for keys, clicks and background results.
 
+use crate::actions::{ActionsView, OpenRun};
 use crate::compose::{Compose, Stage, Target};
 use crate::git::{GraphLine, Repo};
+use crate::github::actions::{Job as RunJob, Run, Saved};
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
@@ -22,11 +24,15 @@ use ratatui::{
 pub enum View {
     Inbox,
     Local,
+    Actions,
 }
 
 impl View {
-    const ALL: [(View, char, &'static str); 2] =
-        [(View::Inbox, '1', "Inbox"), (View::Local, '2', "Local")];
+    const ALL: [(View, char, &'static str); 3] = [
+        (View::Inbox, '1', "Inbox"),
+        (View::Local, '2', "Local"),
+        (View::Actions, '3', "Actions"),
+    ];
 }
 
 /// Everything a key or a click can ask the app to do.
@@ -53,6 +59,10 @@ pub enum Action {
     OpenLog,
     /// Jump to the next (`1`) or previous (`-1`) failure in the open log.
     Failure(isize),
+    /// Re-run the failed jobs of the open workflow run.
+    Rerun,
+    /// Cancel the open workflow run.
+    CancelRun,
     /// Start a merge of the open PR.
     Merge,
     /// Pick the merge method in the merge preview.
@@ -77,6 +87,17 @@ pub enum Message {
     Inbox(Result<Vec<PullRequest>, String>),
     Merged(Result<Vec<PullRequest>, String>),
     Pr(Result<Box<PrPage>, String>),
+    /// Workflow runs, with a fresh body and ETag to save when GitHub sent one.
+    Runs {
+        repo: String,
+        result: Result<(Vec<Run>, Option<Saved>), String>,
+    },
+    /// The jobs of one run.
+    Jobs {
+        repo: String,
+        run_id: i64,
+        result: Result<(Vec<RunJob>, Option<Saved>), String>,
+    },
     History(Result<Vec<GraphLine>, String>),
     Changes(Result<Changes, String>),
     /// `git show` of one commit.
@@ -125,6 +146,16 @@ pub enum Job {
         job_id: i64,
         finished: bool,
     },
+    /// Workflow runs; `saved` (filled from the cache) makes the read conditional.
+    LoadRuns {
+        repo: String,
+        saved: Option<Saved>,
+    },
+    LoadJobs {
+        repo: String,
+        run_id: i64,
+        saved: Option<Saved>,
+    },
     LoadHistory(Repo),
     LoadChanges(Repo),
     ShowCommit(Repo, String),
@@ -147,6 +178,7 @@ pub struct App {
     pub local: Local,
     /// An Actions job log shown over the current view.
     pub log: Option<LogView>,
+    pub actions: ActionsView,
     pub login: Option<String>,
     /// The account the cached Inbox belongs to, until sign-in confirms it.
     cached_login: Option<String>,
@@ -169,6 +201,7 @@ impl Default for App {
             compose: None,
             local: Local::new(Err("No checkout yet".into())),
             log: None,
+            actions: ActionsView::new(Err("No GitHub repository yet".into())),
             login: None,
             cached_login: None,
             status: "Signing in…".into(),
@@ -207,6 +240,9 @@ impl App {
                 if view == View::Local && self.local.history.is_none() {
                     self.load_local();
                 }
+                if view == View::Actions && self.actions.runs.is_none() {
+                    self.load_actions();
+                }
             }
             Action::LocalTab(tab) => {
                 self.local.tab = tab;
@@ -235,6 +271,71 @@ impl App {
                 }
             }
             Action::Back if self.view == View::Local => self.local.commit = None,
+            // The Actions view: the run list, then one run's jobs.
+            Action::Select(index) if self.view == View::Actions => {
+                if index == self.actions.current() {
+                    self.dispatch(Action::Open);
+                } else {
+                    self.actions.select(index);
+                }
+            }
+            Action::Move(delta) if self.view == View::Actions => self.actions.move_selection(delta),
+            Action::Open if self.view == View::Actions => match &self.actions.open {
+                None => {
+                    if let (Ok(repo), Some(run)) = (&self.actions.repo, self.actions.selected_run())
+                    {
+                        self.jobs.push(Job::LoadJobs {
+                            repo: repo.clone(),
+                            run_id: run.id,
+                            saved: None,
+                        });
+                        self.actions.open = Some(OpenRun {
+                            run: run.clone(),
+                            jobs: None,
+                            selected: 0,
+                        });
+                    }
+                }
+                Some(_) => {
+                    if let (Ok(repo), Some(job)) = (&self.actions.repo, self.actions.selected_job())
+                    {
+                        let finished = job.status == "completed";
+                        self.jobs.push(Job::LoadLog {
+                            repo: repo.clone(),
+                            job_id: job.id,
+                            finished,
+                        });
+                        self.log =
+                            Some(LogView::new(job.name.clone(), job.html_url.clone(), job.id));
+                    }
+                }
+            },
+            Action::Back if self.view == View::Actions => self.actions.open = None,
+            Action::Rerun | Action::CancelRun => {
+                let (Ok(repo), Some(open)) = (&self.actions.repo, &self.actions.open) else {
+                    return;
+                };
+                let run = format!(
+                    "{} #{}",
+                    open.run.name.clone().unwrap_or_default(),
+                    open.run.run_number
+                );
+                let kind = if action == Action::Rerun {
+                    WriteKind::Rerun {
+                        repo: repo.clone(),
+                        run_id: open.run.id,
+                        run: run.clone(),
+                    }
+                } else {
+                    WriteKind::CancelRun {
+                        repo: repo.clone(),
+                        run_id: open.run.id,
+                        run: run.clone(),
+                    }
+                };
+                let target = Target::run(repo, &open.run.display_title);
+                self.compose = Some(Compose::new(kind, target));
+            }
             Action::Tab(tab) => {
                 self.inbox.tab = tab;
                 self.inbox.select(0);
@@ -375,6 +476,15 @@ impl App {
                 }
                 self.load_diff_if_needed();
             }
+            Action::OpenInBrowser if self.view == View::Actions => {
+                let url = match &self.actions.open {
+                    Some(open) => Some(open.run.html_url.clone()),
+                    None => self.actions.selected_run().map(|run| run.html_url.clone()),
+                };
+                if let Some(url) = url {
+                    self.jobs.push(Job::Open(url));
+                }
+            }
             Action::OpenInBrowser => {
                 let target = match &self.pr {
                     Some(pr) => Some((pr.summary.reference(), pr.url().to_owned())),
@@ -392,7 +502,11 @@ impl App {
                 }
             }
             Action::Refresh => {
-                if let Some(pr) = &mut self.pr {
+                if self.view == View::Actions {
+                    self.load_actions();
+                } else if self.view == View::Inbox
+                    && let Some(pr) = &mut self.pr
+                {
                     if !pr.loading {
                         pr.loading = true;
                         pr.error = None;
@@ -450,6 +564,26 @@ impl App {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Reads the runs again, and the open run's jobs, unless a read is running.
+    fn load_actions(&mut self) {
+        if let Ok(repo) = &self.actions.repo
+            && !self.actions.loading
+        {
+            self.actions.loading = true;
+            self.jobs.push(Job::LoadRuns {
+                repo: repo.clone(),
+                saved: None,
+            });
+            if let Some(open) = &self.actions.open {
+                self.jobs.push(Job::LoadJobs {
+                    repo: repo.clone(),
+                    run_id: open.run.id,
+                    saved: None,
+                });
+            }
         }
     }
 
@@ -533,6 +667,26 @@ impl App {
                 }
                 self.load_diff_if_needed();
             }
+            Message::Runs { result, .. } => {
+                self.actions.loading = false;
+                self.actions.runs = Some(result.map(|(runs, _)| runs));
+                self.actions.move_selection(0);
+                // The open run's summary follows the newest copy of the list.
+                if let (Some(open), Some(Ok(runs))) = (&mut self.actions.open, &self.actions.runs)
+                    && let Some(fresh) = runs.iter().find(|run| run.id == open.run.id)
+                {
+                    open.run = fresh.clone();
+                }
+            }
+            Message::Jobs { run_id, result, .. } => {
+                if let Some(open) = &mut self.actions.open
+                    && open.run.id == run_id
+                {
+                    let count = result.as_ref().map_or(0, |(jobs, _)| jobs.len());
+                    open.jobs = Some(result.map(|(jobs, _)| jobs));
+                    open.selected = open.selected.min(count.saturating_sub(1));
+                }
+            }
             Message::History(result) => {
                 self.local.loading = false;
                 self.local.history = Some(result);
@@ -558,6 +712,12 @@ impl App {
                 let label = kind.as_ref().map_or("Write".into(), WriteKind::label);
                 self.status = format!("{label} published: {url}");
                 self.dispatch(Action::Refresh);
+                if matches!(
+                    kind,
+                    Some(WriteKind::Rerun { .. } | WriteKind::CancelRun { .. })
+                ) {
+                    self.load_actions();
+                }
                 if matches!(kind, Some(WriteKind::Merge { .. })) {
                     // The PR leaves the open queues and joins the merged list.
                     self.inbox.merged = Default::default();
@@ -753,6 +913,30 @@ impl App {
                     .iter()
                     .map(|(tab, key, _)| Control::hidden(KeyCode::Char(*key), Action::Tab(*tab))),
             );
+        } else if self.view == View::Actions {
+            if self.actions.open.is_some() {
+                controls.push(Control::new(KeyCode::Enter, "Log", Action::Open));
+                controls.push(Control::new(
+                    KeyCode::Char('R'),
+                    "Re-run failed",
+                    Action::Rerun,
+                ));
+                controls.push(Control::new(
+                    KeyCode::Char('C'),
+                    "Cancel run",
+                    Action::CancelRun,
+                ));
+                controls.push(Control::new(KeyCode::Char('b'), "Back", Action::Back));
+                controls.push(Control::hidden(KeyCode::Left, Action::Back));
+                controls.push(Control::hidden(KeyCode::Esc, Action::Back));
+            } else {
+                controls.push(Control::new(KeyCode::Enter, "Open run", Action::Open));
+            }
+            controls.push(Control::new(
+                KeyCode::Char('w'),
+                "Web",
+                Action::OpenInBrowser,
+            ));
         } else if self.view == View::Local {
             if self.local.commit.is_some() {
                 controls.push(Control::new(KeyCode::Char('b'), "Back", Action::Back));
@@ -801,6 +985,7 @@ impl App {
                 None => self.inbox.draw(frame, body),
             },
             (View::Local, None) => self.local.draw(frame, body),
+            (View::Actions, None) => self.actions.draw(frame, body),
         };
         let note = self
             .api_note
@@ -1208,6 +1393,88 @@ mod tests {
                 app.log.is_none() && app.pr.is_some(),
                 "Back closes only the log"
             );
+        }
+    }
+
+    #[test]
+    fn actions_runs_open_to_jobs_logs_and_a_previewed_rerun() {
+        use crate::actions::tests::{job, run};
+        for by_click in [false, true] {
+            let mut app = App {
+                actions: ActionsView::new(Ok("o/a".into())),
+                jobs: Vec::new(),
+                ..App::default()
+            };
+            press(&mut app, KeyCode::Char('3'));
+            assert_eq!(
+                app.jobs,
+                vec![Job::LoadRuns {
+                    repo: "o/a".into(),
+                    saved: None
+                }]
+            );
+            app.jobs.clear();
+            app.receive(Message::Runs {
+                repo: "o/a".into(),
+                result: Ok((vec![run(1, Some("success")), run(2, Some("failure"))], None)),
+            });
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(
+                screen.contains("#2 Change 2") && screen.contains("✗"),
+                "{screen}"
+            );
+            if by_click {
+                click(&mut app, &Action::Select(1));
+                click(&mut app, &Action::Select(1)); // the selected run opens
+            } else {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Enter);
+            }
+            assert!(matches!(&app.jobs[..], [Job::LoadJobs { run_id: 2, .. }]));
+            app.jobs.clear();
+            app.receive(Message::Jobs {
+                repo: "o/a".into(),
+                run_id: 2,
+                result: Ok((vec![job(10, "success"), job(11, "failure")], None)),
+            });
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(
+                screen.contains("job 11") && screen.contains("1. cargo test"),
+                "{screen}"
+            );
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(
+                &app.jobs[..],
+                [Job::LoadLog {
+                    job_id: 11,
+                    finished: true,
+                    ..
+                }]
+            ));
+            app.jobs.clear();
+            press(&mut app, KeyCode::Char('b')); // closes the log
+            assert!(app.log.is_none() && app.actions.open.is_some());
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::Rerun);
+            } else {
+                press(&mut app, KeyCode::Char('R'));
+            }
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(
+                screen.contains("Re-run the failed jobs of CI #2 in o/a"),
+                "{screen}"
+            );
+            assert!(app.jobs.is_empty(), "nothing is sent by the preview");
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(
+                &app.jobs[..],
+                [Job::Write {
+                    kind: WriteKind::Rerun { run_id: 2, .. },
+                    ..
+                }]
+            ));
         }
     }
 

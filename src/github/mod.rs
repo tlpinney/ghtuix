@@ -8,6 +8,7 @@ use graphql_client::{GraphQLQuery, QueryBody, Response};
 use std::process::Command;
 use std::sync::Arc;
 
+pub mod actions;
 pub mod budget;
 pub mod inbox;
 pub mod pr;
@@ -16,6 +17,13 @@ pub mod write;
 
 /// Largest response body read (a big diff can be many megabytes).
 const MAX_BODY: u64 = 32 * 1024 * 1024;
+
+/// A REST answer: the body, or `None` for `304 Not Modified`, and its `ETag`.
+#[derive(Debug)]
+pub struct Reply {
+    pub body: Option<String>,
+    pub etag: Option<String>,
+}
 
 /// A signed-in connection to one GitHub host.
 #[derive(Clone)]
@@ -100,25 +108,58 @@ impl Client {
     /// One REST GET of `path` (relative to the API root) as text, with an `Accept` type
     /// such as `application/vnd.github.diff`.
     pub fn rest_text(&self, path: &str, accept: &str) -> Result<String> {
+        let reply = self.rest("GET", path, accept, None)?;
+        Ok(reply.body.unwrap_or_default())
+    }
+
+    /// A conditional GET: with the `ETag` of an earlier answer, GitHub replies
+    /// `304 Not Modified` (which costs no rate limit) when nothing changed.
+    pub fn rest_conditional(&self, path: &str, etag: Option<&str>) -> Result<Reply> {
+        self.rest("GET", path, "application/vnd.github+json", etag)
+    }
+
+    /// A REST write (`POST` with no body). Writes go one at a time, a second apart.
+    pub fn rest_post(&self, path: &str) -> Result<()> {
+        let _turn = self.gate.write_turn();
+        self.rest("POST", path, "application/vnd.github+json", None)
+            .map(|_| ())
+    }
+
+    fn rest(&self, method: &str, path: &str, accept: &str, etag: Option<&str>) -> Result<Reply> {
         let url = format!("{}/{path}", self.rest_url);
         let _slot = self
             .gate
             .enter(crate::time::now())
             .map_err(|refused| anyhow!(refused))?;
-        let mut response = self
-            .agent
-            .get(&url)
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .header("Accept", accept)
-            .call()
-            .with_context(|| format!("Could not reach {url}"))?;
+        let auth = format!("Bearer {}", self.token);
+        let response = if method == "POST" {
+            self.agent
+                .post(&url)
+                .header("Authorization", &auth)
+                .header("Accept", accept)
+                .send_empty()
+        } else {
+            let mut request = self
+                .agent
+                .get(&url)
+                .header("Authorization", &auth)
+                .header("Accept", accept);
+            if let Some(etag) = etag {
+                request = request.header("If-None-Match", etag);
+            }
+            request.call()
+        };
+        let mut response = response.with_context(|| format!("Could not reach {url}"))?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        self.gate.observe(
-            status,
-            |name| Some(headers.get(name)?.to_str().ok()?.to_owned()),
-            crate::time::now(),
-        );
+        let header = |name: &str| Some(headers.get(name)?.to_str().ok()?.to_owned());
+        self.gate.observe(status, header, crate::time::now());
+        if status == 304 {
+            return Ok(Reply {
+                body: None,
+                etag: etag.map(str::to_owned),
+            });
+        }
         let text = response
             .body_mut()
             .with_config()
@@ -128,7 +169,10 @@ impl Client {
         if !(200..300).contains(&status) {
             bail!("GitHub returned HTTP {status}: {}", http_message(&text));
         }
-        Ok(text)
+        Ok(Reply {
+            body: Some(text),
+            etag: header("etag"),
+        })
     }
 }
 

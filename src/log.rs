@@ -138,7 +138,8 @@ impl LogView {
 pub fn parse(text: &str) -> Vec<(String, Kind)> {
     let mut out = Vec::new();
     for raw in text.lines() {
-        let line = trim_timestamp(raw.trim_end_matches('\r'));
+        // GitHub starts a log with a byte-order mark.
+        let line = trim_timestamp(raw.trim_start_matches('\u{feff}').trim_end_matches('\r'));
         if line.starts_with("##[endgroup]") {
             continue;
         }
@@ -202,6 +203,8 @@ mod tests {
         assert_eq!(lines[3].1, Kind::Warning);
         assert_eq!(lines[4].0, "Process completed with exit code 101.");
         assert_eq!(trim_timestamp("plain line"), "plain line");
+        let bom = parse("\u{feff}2026-10-28T03:08:18.1848113Z Current runner version");
+        assert_eq!(bom[0].0, "Current runner version");
     }
 
     #[test]

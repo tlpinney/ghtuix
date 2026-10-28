@@ -94,6 +94,11 @@ pub fn log_key(host: &str, login: &str, repo: &str, job_id: i64) -> String {
     format!("{host}/{login}/log/{repo}/{job_id}")
 }
 
+/// Where a REST read's last body and `ETag` are kept, for conditional reads.
+pub fn etag_key(host: &str, login: &str, what: &str) -> String {
+    format!("{host}/{login}/etag/{what}")
+}
+
 /// The account last signed in on `host`.
 pub fn login_key(host: &str) -> String {
     format!("{host}/login")

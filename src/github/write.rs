@@ -109,6 +109,13 @@ pub fn publish(
             .filter(|pr| pr.merged)
             .map(|pr| pr.url)
             .ok_or_else(missing),
+        WriteKind::Rerun { repo, run_id, .. } => {
+            super::actions::rerun_failed(client, repo, *run_id)
+                .map(|()| "re-run requested".to_string())
+        }
+        WriteKind::CancelRun { repo, run_id, .. } => {
+            super::actions::cancel(client, repo, *run_id).map(|()| "cancel requested".to_string())
+        }
         WriteKind::Resolve {
             thread_id,
             resolve: true,

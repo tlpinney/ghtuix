@@ -98,6 +98,12 @@ impl Repo {
         Ok(parse_status(&out))
     }
 
+    /// `owner/name` of the `origin` remote when it is on GitHub host `host`.
+    pub fn github_repo(&self, host: &str) -> Option<String> {
+        let url = self.git(&["remote", "get-url", "origin"]).ok()?;
+        repo_from_url(url.trim(), host)
+    }
+
     /// Changes not yet staged.
     pub fn working_diff(&self) -> Result<String> {
         self.git(&["diff", "--no-ext-diff"])
@@ -134,6 +140,19 @@ fn run(dir: &Path, args: &[&str]) -> Result<String> {
         bail!("git {}: {}", args[0], stderr.trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `owner/name` from a remote URL on `host` (`git@host:o/n.git`, `https://host/o/n`,
+/// `ssh://git@host/o/n.git`).
+fn repo_from_url(url: &str, host: &str) -> Option<String> {
+    let path = url
+        .strip_prefix(&format!("git@{host}:"))
+        .or_else(|| url.strip_prefix(&format!("https://{host}/")))
+        .or_else(|| url.strip_prefix(&format!("ssh://git@{host}/")))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let (owner, name) = path.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .then(|| format!("{owner}/{name}"))
 }
 
 fn parse_graph_line(line: &str) -> GraphLine {
@@ -279,6 +298,23 @@ mod tests {
     fn refuses_anything_but_a_commit_id() {
         let (repo, _) = repo();
         assert!(repo.show("--output=/tmp/x").is_err());
+    }
+
+    #[test]
+    fn finds_the_github_repository_of_a_remote_url() {
+        for url in [
+            "git@github.com:tlpinney/ghtui.git",
+            "https://github.com/tlpinney/ghtui",
+            "https://github.com/tlpinney/ghtui.git/",
+            "ssh://git@github.com/tlpinney/ghtui.git",
+        ] {
+            assert_eq!(
+                repo_from_url(url, "github.com").as_deref(),
+                Some("tlpinney/ghtui")
+            );
+        }
+        assert_eq!(repo_from_url("git@gitlab.com:a/b.git", "github.com"), None);
+        assert_eq!(repo_from_url("https://github.com/a", "github.com"), None);
     }
 
     #[test]

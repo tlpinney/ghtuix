@@ -31,6 +31,19 @@ pub struct Target {
 }
 
 impl Target {
+    /// A workflow run as the target of an Actions write (no PR fields).
+    pub fn run(repo: &str, title: &str) -> Self {
+        Self {
+            reference: repo.to_owned(),
+            title: title.to_owned(),
+            pr_id: String::new(),
+            head_oid: String::new(),
+            base_ref: String::new(),
+            merge_state: String::new(),
+            merge_methods: Vec::new(),
+        }
+    }
+
     pub fn of(page: &PrPage) -> Self {
         Self {
             reference: format!("{}#{}", page.repo, page.number),
@@ -99,6 +112,10 @@ impl Compose {
                 format!("{verb} the review thread on {place} of")
             }
             WriteKind::Merge { .. } => "Merge".into(),
+            WriteKind::Rerun { run, repo, .. } => {
+                format!("Re-run the failed jobs of {run} in {repo}")
+            }
+            WriteKind::CancelRun { run, repo, .. } => format!("Cancel {run} in {repo}"),
         };
         let short = self.target.head_oid.chars().take(12).collect::<String>();
         let mut lines = vec![

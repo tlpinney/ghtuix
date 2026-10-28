@@ -1,3 +1,4 @@
+mod actions;
 mod app;
 mod cache;
 mod compose;
@@ -49,10 +50,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
     let host: Arc<str> = config.host().into();
     let mut app = App::default();
     app.inbox.hidden = config.excluded_repositories;
+    let checkout = std::env::current_dir()
+        .map_err(anyhow::Error::from)
+        .and_then(|dir| git::Repo::discover(&dir));
+    app.actions = actions::ActionsView::new(match &checkout {
+        Ok(repo) => repo.github_repo(&host).ok_or_else(|| {
+            format!("This checkout has no origin remote on {host}, so it has no Actions here")
+        }),
+        Err(_) => Err("Not inside a Git checkout: start ghtuix in one to see its Actions".into()),
+    });
     app.local = local::Local::new(
-        std::env::current_dir()
-            .map_err(anyhow::Error::from)
-            .and_then(|dir| git::Repo::discover(&dir))
+        checkout
             .map_err(|_| "Not inside a Git checkout: start ghtuix in one to see it here".into()),
     );
     // A cache that cannot open only costs the instant start.
@@ -83,6 +91,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
         }
         let jobs: Vec<Job> = app.jobs.drain(..).collect();
         for job in jobs {
+            let job = match &cache {
+                Some(cache) => with_saved(cache, &host, job),
+                None => job,
+            };
             // The cache answers what has not changed; only the rest goes to GitHub.
             match cache
                 .as_ref()
@@ -150,6 +162,38 @@ fn from_cache(cache: &cache::Cache, host: &str, job: &Job) -> Option<Message> {
     }
 }
 
+/// Where a conditional Actions read keeps its last body and `ETag`.
+fn etag_what(repo: &str, run_id: Option<i64>) -> String {
+    match run_id {
+        Some(run_id) => format!("jobs/{repo}/{run_id}"),
+        None => format!("runs/{repo}"),
+    }
+}
+
+/// Adds the saved body and `ETag` to an Actions read, so GitHub can answer `304`.
+fn with_saved(cache: &cache::Cache, host: &str, job: Job) -> Job {
+    let Some((login, _)) = cache.get::<String>(&cache::login_key(host)) else {
+        return job;
+    };
+    let saved = |what: String| {
+        cache
+            .get::<github::actions::Saved>(&cache::etag_key(host, &login, &what))
+            .map(|(saved, _)| saved)
+    };
+    match job {
+        Job::LoadRuns { repo, .. } => Job::LoadRuns {
+            saved: saved(etag_what(&repo, None)),
+            repo,
+        },
+        Job::LoadJobs { repo, run_id, .. } => Job::LoadJobs {
+            saved: saved(etag_what(&repo, Some(run_id))),
+            repo,
+            run_id,
+        },
+        other => other,
+    }
+}
+
 /// Keeps what a message brings for later. Cache errors are not worth an error.
 fn save(cache: &cache::Cache, host: &str, message: &Message) {
     if let Message::SignedIn(Ok(login)) = message {
@@ -169,6 +213,21 @@ fn save(cache: &cache::Cache, host: &str, message: &Message) {
             head,
             result: Ok(diff),
         } => cache.put(&cache::diff_key(host, &login, base, head), diff),
+        Message::Runs {
+            repo,
+            result: Ok((_, Some(saved))),
+        } => cache.put(
+            &cache::etag_key(host, &login, &etag_what(repo, None)),
+            saved,
+        ),
+        Message::Jobs {
+            repo,
+            run_id,
+            result: Ok((_, Some(saved))),
+        } => cache.put(
+            &cache::etag_key(host, &login, &etag_what(repo, Some(*run_id))),
+            saved,
+        ),
         // Only a finished job's log is final; a running job's log keeps growing.
         Message::Log {
             repo,
@@ -231,6 +290,21 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 repo,
                 job_id,
                 finished,
+            },
+            Job::LoadRuns { repo, saved } => Message::Runs {
+                result: client()
+                    .and_then(|c| github::actions::runs(&c, &repo, saved).map_err(text)),
+                repo,
+            },
+            Job::LoadJobs {
+                repo,
+                run_id,
+                saved,
+            } => Message::Jobs {
+                result: client()
+                    .and_then(|c| github::actions::jobs(&c, &repo, run_id, saved).map_err(text)),
+                repo,
+                run_id,
             },
             Job::LoadHistory(repo) => Message::History(repo.history(500).map_err(text)),
             Job::LoadChanges(repo) => Message::Changes(
