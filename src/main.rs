@@ -9,6 +9,7 @@ mod github;
 mod inbox;
 mod keybar;
 mod local;
+mod log;
 mod markdown;
 mod model;
 mod pr;
@@ -124,6 +125,19 @@ fn from_cache(cache: &cache::Cache, host: &str, job: &Job) -> Option<Message> {
             let (page, _) = cache.get::<model::PrPage>(&key)?;
             (page.updated_at == *updated_at).then(|| Message::Pr(Ok(Box::new(page))))
         }
+        Job::LoadLog {
+            repo,
+            job_id,
+            finished: true,
+        } => {
+            let (log, _) = cache.get::<String>(&cache::log_key(host, &login, repo, *job_id))?;
+            Some(Message::Log {
+                repo: repo.clone(),
+                job_id: *job_id,
+                finished: true,
+                result: Ok(log),
+            })
+        }
         Job::LoadDiff { base, head, .. } => {
             let (diff, _) = cache.get::<String>(&cache::diff_key(host, &login, base, head))?;
             Some(Message::Diff {
@@ -155,6 +169,13 @@ fn save(cache: &cache::Cache, host: &str, message: &Message) {
             head,
             result: Ok(diff),
         } => cache.put(&cache::diff_key(host, &login, base, head), diff),
+        // Only a finished job's log is final; a running job's log keeps growing.
+        Message::Log {
+            repo,
+            job_id,
+            finished: true,
+            result: Ok(log),
+        } => cache.put(&cache::log_key(host, &login, repo, *job_id), log),
         _ => Ok(()),
     };
 }
@@ -201,6 +222,16 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
             Job::LoadMerged => {
                 Message::Merged(client().and_then(|c| github::inbox::merged(&c).map_err(text)))
             }
+            Job::LoadLog {
+                repo,
+                job_id,
+                finished,
+            } => Message::Log {
+                result: client().and_then(|c| github::pr::job_log(&c, &repo, job_id).map_err(text)),
+                repo,
+                job_id,
+                finished,
+            },
             Job::LoadHistory(repo) => Message::History(repo.history(500).map_err(text)),
             Job::LoadChanges(repo) => Message::Changes(
                 repo.status()

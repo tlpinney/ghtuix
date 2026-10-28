@@ -15,7 +15,7 @@ pub mod viewer;
 pub mod write;
 
 /// Largest response body read (a big diff can be many megabytes).
-const MAX_BODY: u64 = 8 * 1024 * 1024;
+const MAX_BODY: u64 = 32 * 1024 * 1024;
 
 /// A signed-in connection to one GitHub host.
 #[derive(Clone)]
@@ -35,6 +35,8 @@ impl Client {
         let token = token(host)?;
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            // GitHub redirects downloads (logs) to blob storage: the token stays here.
+            .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
             .user_agent(concat!("ghtuix/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();

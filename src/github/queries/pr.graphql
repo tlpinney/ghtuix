@@ -85,6 +85,12 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
                 nodes {
                   __typename
                   ... on CheckRun {
+                    databaseId
+                    checkSuite {
+                      app {
+                        slug
+                      }
+                    }
                     name
                     status
                     conclusion

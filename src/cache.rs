@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// The shape of what the cache stores. Bump it whenever a cached type changes meaning
 /// (a field added, a body read differently): older entries are then dropped on open.
-const FORMAT: i32 = 6;
+const FORMAT: i32 = 8;
 
 pub struct Cache {
     db: Connection,
@@ -87,6 +87,11 @@ pub fn pr_key(host: &str, login: &str, repo: &str, number: i64) -> String {
 /// Where the diff between two commits is stored (it never changes).
 pub fn diff_key(host: &str, login: &str, base: &str, head: &str) -> String {
     format!("{host}/{login}/diff/{base}..{head}")
+}
+
+/// Where a finished Actions job's log is stored (it no longer changes).
+pub fn log_key(host: &str, login: &str, repo: &str, job_id: i64) -> String {
+    format!("{host}/{login}/log/{repo}/{job_id}")
 }
 
 /// The account last signed in on `host`.

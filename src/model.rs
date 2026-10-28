@@ -232,6 +232,8 @@ pub struct FileChange {
 /// One check run or commit status on the head commit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Check {
+    /// The GitHub Actions job behind a check run, whose log can be read.
+    pub job_id: Option<i64>,
     pub name: String,
     pub state: Checks,
     /// GitHub's wording for the state, such as `success` or `in progress`.

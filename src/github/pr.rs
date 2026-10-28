@@ -50,6 +50,15 @@ pub fn page(client: &Client, repo: &str, number: i64) -> Result<crate::model::Pr
     Ok(convert(repo, pr, methods))
 }
 
+/// The log of a GitHub Actions job: GitHub redirects to short-lived blob storage, and the
+/// token is never sent along on that redirect.
+pub fn job_log(client: &Client, repo: &str, job_id: i64) -> Result<String> {
+    client.rest_text(
+        &format!("repos/{repo}/actions/jobs/{job_id}/logs"),
+        "application/vnd.github+json",
+    )
+}
+
 /// The unified diff from `base` to `head` (commit SHAs, so it never changes).
 pub fn diff(client: &Client, repo: &str, number: i64) -> Result<String> {
     client.rest_text(
@@ -209,7 +218,13 @@ fn check(
                 }
                 (None, status) => (Checks::Pending, format!("{status:?}").to_lowercase()),
             };
+            // Only GitHub Actions check runs are jobs with a log to download.
+            let actions = run
+                .check_suite
+                .app
+                .is_some_and(|app| app.slug == "github-actions");
             Some(Check {
+                job_id: run.database_id.filter(|_| actions),
                 name: run.name,
                 state,
                 detail: detail.replace('_', " "),
@@ -223,6 +238,7 @@ fn check(
                 _ => Checks::Pending,
             };
             Some(Check {
+                job_id: None,
                 name: status.context,
                 state,
                 detail: format!("{:?}", status.state).to_lowercase(),

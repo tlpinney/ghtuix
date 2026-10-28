@@ -5,6 +5,7 @@ use crate::git::{GraphLine, Repo};
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
+use crate::log::LogView;
 use crate::model::{MergeMethod, PrPage, PullRequest, WriteKind};
 use crate::pr::{Anchor, PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -48,6 +49,10 @@ pub enum Action {
     ReplyThread,
     /// Resolve or unresolve the thread under the cursor.
     ToggleResolve,
+    /// Open the log of the check under the cursor.
+    OpenLog,
+    /// Jump to the next (`1`) or previous (`-1`) failure in the open log.
+    Failure(isize),
     /// Start a merge of the open PR.
     Merge,
     /// Pick the merge method in the merge preview.
@@ -79,6 +84,13 @@ pub enum Message {
         sha: String,
         result: Result<String, String>,
     },
+    /// An Actions job's log.
+    Log {
+        repo: String,
+        job_id: i64,
+        finished: bool,
+        result: Result<String, String>,
+    },
     /// A write finished: the new comment's or review's URL, or why it failed.
     Written(Result<String, String>),
     /// The diff between two commits of an open PR.
@@ -107,6 +119,12 @@ pub enum Job {
         base: String,
         head: String,
     },
+    /// Download a job's log; a finished job's log may come from the cache.
+    LoadLog {
+        repo: String,
+        job_id: i64,
+        finished: bool,
+    },
     LoadHistory(Repo),
     LoadChanges(Repo),
     ShowCommit(Repo, String),
@@ -127,6 +145,8 @@ pub struct App {
     /// A write being composed on the open PR.
     pub compose: Option<Compose>,
     pub local: Local,
+    /// An Actions job log shown over the current view.
+    pub log: Option<LogView>,
     pub login: Option<String>,
     /// The account the cached Inbox belongs to, until sign-in confirms it.
     cached_login: Option<String>,
@@ -148,6 +168,7 @@ impl Default for App {
             pr: None,
             compose: None,
             local: Local::new(Err("No checkout yet".into())),
+            log: None,
             login: None,
             cached_login: None,
             status: "Signing in…".into(),
@@ -162,6 +183,24 @@ impl Default for App {
 impl App {
     /// The single entry point for every action.
     pub fn dispatch(&mut self, action: Action) {
+        // An open log takes scrolling, failure jumps and Back.
+        if let Some(log) = &mut self.log {
+            match action {
+                Action::Move(delta) => return log.scroll_by(delta),
+                Action::Failure(direction) => return log.jump(direction),
+                Action::Back => {
+                    self.log = None;
+                    return;
+                }
+                Action::OpenInBrowser => {
+                    if let Some(url) = log.url.clone() {
+                        self.jobs.push(Job::Open(url));
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         match action {
             Action::Show(view) => {
                 self.view = view;
@@ -216,6 +255,7 @@ impl App {
                         // A click on the line already under the cursor acts on it.
                         match pr.tab {
                             PrTab::Files => self.dispatch(Action::CommentLine),
+                            PrTab::Checks => self.dispatch(Action::OpenLog),
                             _ => self.dispatch(Action::ReplyThread),
                         }
                     } else {
@@ -223,6 +263,32 @@ impl App {
                     }
                 }
             }
+            Action::OpenLog => {
+                let Some(pr) = &self.pr else { return };
+                let (Some(page), Some(Anchor::Check(index))) = (&pr.page, pr.anchor()) else {
+                    return;
+                };
+                let Some(check) = page.checks.get(index) else {
+                    return;
+                };
+                match check.job_id {
+                    Some(job_id) => {
+                        let finished = check.state != crate::model::Checks::Pending;
+                        self.jobs.push(Job::LoadLog {
+                            repo: page.repo.clone(),
+                            job_id,
+                            finished,
+                        });
+                        self.log =
+                            Some(LogView::new(check.name.clone(), check.url.clone(), job_id));
+                    }
+                    None => {
+                        self.status =
+                            format!("{} is not a GitHub Actions job; w opens it", check.name);
+                    }
+                }
+            }
+            Action::Failure(_) => {}
             Action::Merge => {
                 let Some(page) = self.pr.as_ref().and_then(|pr| pr.page.as_ref()) else {
                     self.status = "Wait for the PR to load before merging".into();
@@ -480,6 +546,13 @@ impl App {
                     *shown = Some(result.unwrap_or_else(|error| error));
                 }
             }
+            Message::Log { job_id, result, .. } => {
+                if let Some(log) = &mut self.log
+                    && log.job_id == job_id
+                {
+                    log.load(result);
+                }
+            }
             Message::Written(Ok(url)) => {
                 let kind = self.compose.take().map(|c| c.kind);
                 let label = kind.as_ref().map_or("Write".into(), WriteKind::label);
@@ -590,6 +663,28 @@ impl App {
     /// The controls of the current view, in priority order (the key bar draws what fits).
     fn controls(&self) -> Vec<Control> {
         let mut controls = Vec::new();
+        if self.log.is_some() {
+            controls.push(Control::new(
+                KeyCode::Char('>'),
+                "Next failure",
+                Action::Failure(1),
+            ));
+            controls.push(Control::new(
+                KeyCode::Char('<'),
+                "Previous",
+                Action::Failure(-1),
+            ));
+            controls.push(Control::new(KeyCode::Char('b'), "Back", Action::Back));
+            controls.push(Control::hidden(KeyCode::Left, Action::Back));
+            controls.push(Control::hidden(KeyCode::Esc, Action::Back));
+            controls.push(Control::new(
+                KeyCode::Char('w'),
+                "Web",
+                Action::OpenInBrowser,
+            ));
+            controls.push(Control::new(KeyCode::Char('q'), "Quit", Action::Quit));
+            return controls;
+        }
         if self.view == View::Inbox && self.pr.is_some() {
             controls.push(Control::new(KeyCode::Char('b'), "Back", Action::Back));
             controls.push(Control::hidden(KeyCode::Left, Action::Back));
@@ -620,6 +715,9 @@ impl App {
                     0,
                     Control::new(KeyCode::Char('i'), "Comment on line", Action::CommentLine),
                 ),
+                Some((PrTab::Checks, Anchor::Check(_))) => {
+                    controls.insert(0, Control::new(KeyCode::Enter, "Log", Action::OpenLog))
+                }
                 Some((PrTab::Conversation, Anchor::Thread(index))) => {
                     let resolved = self
                         .pr
@@ -696,12 +794,13 @@ impl App {
             ])),
             header,
         );
-        let mut hits = match self.view {
-            View::Inbox => match &mut self.pr {
+        let mut hits = match (self.view, &mut self.log) {
+            (_, Some(log)) => log.draw(frame, body),
+            (View::Inbox, None) => match &mut self.pr {
                 Some(pr) => pr.draw(frame, body),
                 None => self.inbox.draw(frame, body),
             },
-            View::Local => self.local.draw(frame, body),
+            (View::Local, None) => self.local.draw(frame, body),
         };
         let note = self
             .api_note
@@ -1069,6 +1168,47 @@ mod tests {
         press(&mut draft, KeyCode::Char('M'));
         assert!(draft.compose.is_none());
         assert!(draft.status.contains("draft"), "{}", draft.status);
+    }
+
+    #[test]
+    fn a_check_opens_its_log_at_the_first_failure_by_key_or_click() {
+        for by_click in [false, true] {
+            let mut app = open_pr(PrTab::Checks);
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("Enter Log"), "{screen}");
+            if by_click {
+                click(&mut app, &Action::Cursor(0)); // already under the cursor: opens
+            } else {
+                press(&mut app, KeyCode::Enter);
+            }
+            assert_eq!(
+                app.jobs,
+                vec![Job::LoadLog {
+                    repo: "o/a".into(),
+                    job_id: 42,
+                    finished: true
+                }]
+            );
+            app.receive(Message::Log {
+                repo: "o/a".into(),
+                job_id: 42,
+                finished: true,
+                result: Ok("ok\nerror: boom\nmore\nerror: again".into()),
+            });
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("failure 1 of 2"), "{screen}");
+            if by_click {
+                click(&mut app, &Action::Failure(1));
+            } else {
+                press(&mut app, KeyCode::Char('>'));
+            }
+            assert!(draw(&mut app, 140).join("\n").contains("failure 2 of 2"));
+            press(&mut app, KeyCode::Char('b'));
+            assert!(
+                app.log.is_none() && app.pr.is_some(),
+                "Back closes only the log"
+            );
+        }
     }
 
     #[test]

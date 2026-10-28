@@ -35,6 +35,8 @@ pub enum Anchor {
     Thread(usize),
     /// A diff line (Files).
     Line(crate::diff::Place),
+    /// `page.checks[i]` (Checks).
+    Check(usize),
 }
 
 pub struct PrView {
@@ -216,7 +218,7 @@ impl PrView {
             PrTab::Summary => (summary(page), Vec::new()),
             PrTab::Conversation => conversation(page),
             PrTab::Files => files(page, self.diff.as_deref(), self.diff_loading),
-            PrTab::Checks => (checks(page), Vec::new()),
+            PrTab::Checks => checks(page),
         }
     }
 }
@@ -343,11 +345,15 @@ fn files(
     (lines, anchors)
 }
 
-fn checks(page: &PrPage) -> Vec<Line<'static>> {
+fn checks(page: &PrPage) -> (Vec<Line<'static>>, Vec<(usize, Anchor)>) {
     if page.checks.is_empty() {
-        return vec![Line::raw("No checks on the head commit")];
+        return (vec![Line::raw("No checks on the head commit")], Vec::new());
     }
-    page.checks
+    let anchors = (0..page.checks.len())
+        .map(|i| (i, Anchor::Check(i)))
+        .collect();
+    let lines = page
+        .checks
         .iter()
         .map(|check| {
             let (mark, color) = match check.state {
@@ -360,7 +366,8 @@ fn checks(page: &PrPage) -> Vec<Line<'static>> {
                 Span::raw(format!("{} — {}", check.name, check.detail)),
             ])
         })
-        .collect()
+        .collect();
+    (lines, anchors)
 }
 
 #[cfg(test)]
@@ -419,6 +426,7 @@ pub(crate) mod tests {
                 change: "modified".into(),
             }],
             checks: vec![Check {
+                job_id: Some(42),
                 name: "CodeRabbit".into(),
                 state: Checks::Passing,
                 detail: "success".into(),
