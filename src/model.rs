@@ -52,6 +52,29 @@ impl Stance {
     }
 }
 
+/// What a write does to a pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteKind {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl WriteKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comment => "Comment",
+            Self::Approve => "Approve",
+            Self::RequestChanges => "Request changes",
+        }
+    }
+
+    /// Whether the text may be empty (an approval needs no words).
+    pub fn body_optional(self) -> bool {
+        self == Self::Approve
+    }
+}
+
 /// A GitHub user, bot or team (a team's login is `org/slug`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Person {
@@ -151,6 +174,8 @@ pub struct Check {
 /// Everything the PR view shows, read in one query (the diff comes separately).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrPage {
+    /// GitHub's node id, which writes address.
+    pub id: String,
     pub repo: String,
     pub number: i64,
     pub title: String,

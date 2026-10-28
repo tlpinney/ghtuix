@@ -1,0 +1,18 @@
+# Writes. Each runs only after the user confirms a preview of exactly this effect.
+mutation AddComment($subject: ID!, $body: String!) {
+  addComment(input: { subjectId: $subject, body: $body }) {
+    commentEdge {
+      node {
+        url
+      }
+    }
+  }
+}
+
+mutation AddReview($pr: ID!, $commit: GitObjectID!, $event: PullRequestReviewEvent!, $body: String) {
+  addPullRequestReview(input: { pullRequestId: $pr, commitOID: $commit, event: $event, body: $body }) {
+    pullRequestReview {
+      url
+    }
+  }
+}

@@ -3,7 +3,6 @@ name = "ghtuix"
 version = "0.1.0"
 edition = "2024"
 description = "A small, fast terminal UI for GitHub pull requests and local Git"
-license = "MIT"
 publish = false
 
 [dependencies]

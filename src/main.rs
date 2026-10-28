@@ -1,6 +1,8 @@
 mod app;
 mod cache;
+mod compose;
 mod config;
+mod editor;
 mod github;
 mod inbox;
 mod keybar;
@@ -10,7 +12,10 @@ mod time;
 
 use anyhow::Result;
 use app::{App, Job, Message};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
+};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,9 +29,13 @@ type Session = Arc<Mutex<Option<github::Client>>>;
 fn main() -> Result<()> {
     let config = config::Config::load()?;
     let mut terminal = ratatui::init();
-    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let result = run(&mut terminal, config);
-    crossterm::execute!(std::io::stdout(), DisableMouseCapture)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     ratatui::restore();
     result
 }
@@ -77,6 +86,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => app.key(key),
                 Event::Mouse(mouse) => app.mouse(mouse),
+                Event::Paste(text) => app.paste(&text),
                 _ => {}
             }
         }
@@ -181,6 +191,14 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
             Job::LoadMerged => {
                 Message::Merged(client().and_then(|c| github::inbox::merged(&c).map_err(text)))
             }
+            Job::Write {
+                kind,
+                pr_id,
+                head_oid,
+                body,
+            } => Message::Written(client().and_then(|c| {
+                github::write::publish(&c, kind, &pr_id, &head_oid, &body).map_err(text)
+            })),
             Job::Open(url) => {
                 let opener = if cfg!(target_os = "macos") {
                     "open"

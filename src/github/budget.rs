@@ -102,7 +102,12 @@ fn wait(seconds: i64) -> String {
 pub struct Gate {
     state: Mutex<(Budget, usize)>,
     freed: Condvar,
+    /// When the last write finished; held for the whole of each write.
+    last_write: Mutex<Option<std::time::Instant>>,
 }
+
+/// The pause GitHub asks for between writes.
+pub const WRITE_SPACING: Duration = Duration::from_secs(1);
 
 impl Gate {
     /// Waits for a free slot; refuses at once while GitHub has asked to wait.
@@ -121,12 +126,33 @@ impl Gate {
         Ok(Slot { gate: self })
     }
 
+    /// Waits for the previous write to finish and for [`WRITE_SPACING`] to pass; the turn
+    /// lasts until the returned guard drops.
+    pub fn write_turn(&self) -> WriteTurn<'_> {
+        let last = self.last_write.lock().unwrap();
+        if let Some(at) = *last {
+            std::thread::sleep(WRITE_SPACING.saturating_sub(at.elapsed()));
+        }
+        WriteTurn { last }
+    }
+
     pub fn budget(&self) -> Budget {
         self.state.lock().unwrap().0
     }
 
     pub fn observe(&self, status: u16, header: impl Fn(&str) -> Option<String>, now: i64) {
         self.state.lock().unwrap().0.observe(status, header, now);
+    }
+}
+
+/// One write's turn; records when it ended.
+pub struct WriteTurn<'a> {
+    last: std::sync::MutexGuard<'a, Option<std::time::Instant>>,
+}
+
+impl Drop for WriteTurn<'_> {
+    fn drop(&mut self) {
+        *self.last = Some(std::time::Instant::now());
     }
 }
 
@@ -201,6 +227,15 @@ mod tests {
         gate.observe(429, headers(&[("retry-after", "30")]), 100);
         assert!(gate.enter(110).unwrap_err().contains("resume in 20s"));
         assert!(gate.enter(131).is_ok());
+    }
+
+    #[test]
+    fn writes_are_spaced_at_least_a_second_apart() {
+        let gate = Gate::default();
+        drop(gate.write_turn());
+        let start = std::time::Instant::now();
+        drop(gate.write_turn());
+        assert!(start.elapsed() >= WRITE_SPACING - Duration::from_millis(5));
     }
 
     #[test]

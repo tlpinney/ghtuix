@@ -316,6 +316,7 @@ pub(crate) mod tests {
             bot,
         };
         PrPage {
+            id: "PR_1".into(),
             repo: "o/a".into(),
             number: 1,
             title: "Change 1".into(),

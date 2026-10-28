@@ -146,6 +146,7 @@ fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage 
         _ => Decision::None,
     };
     crate::model::PrPage {
+        id: pr.id,
         repo: repo.into(),
         number: pr.number,
         title: pr.title,

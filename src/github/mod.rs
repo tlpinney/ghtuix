@@ -12,6 +12,7 @@ pub mod budget;
 pub mod inbox;
 pub mod pr;
 pub mod viewer;
+pub mod write;
 
 /// Largest response body read (a big diff can be many megabytes).
 const MAX_BODY: u64 = 8 * 1024 * 1024;
@@ -88,6 +89,12 @@ impl Client {
 }
 
 impl Client {
+    /// Runs a mutation. Writes go one at a time, at least a second apart, as GitHub asks.
+    pub fn mutate<Q: GraphQLQuery>(&self, variables: Q::Variables) -> Result<Q::ResponseData> {
+        let _turn = self.gate.write_turn();
+        self.graphql::<Q>(variables)
+    }
+
     /// One REST GET of `path` (relative to the API root) as text, with an `Accept` type
     /// such as `application/vnd.github.diff`.
     pub fn rest_text(&self, path: &str, accept: &str) -> Result<String> {

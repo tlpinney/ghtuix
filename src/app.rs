@@ -1,8 +1,9 @@
 //! Application state and the one dispatch path for keys, clicks and background results.
 
+use crate::compose::{Compose, Stage, Target};
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
-use crate::model::{PrPage, PullRequest};
+use crate::model::{PrPage, PullRequest, WriteKind};
 use crate::pr::{PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -37,6 +38,13 @@ pub enum Action {
     /// Leave the open PR.
     Back,
     PrTab(PrTab),
+    /// Start writing a comment or review on the open PR.
+    Compose(WriteKind),
+    ComposePreview,
+    ComposeConfirm,
+    /// Back from the preview to editing.
+    ComposeEdit,
+    ComposeCancel,
     OpenInBrowser,
     Refresh,
     Quit,
@@ -49,6 +57,8 @@ pub enum Message {
     Inbox(Result<Vec<PullRequest>, String>),
     Merged(Result<Vec<PullRequest>, String>),
     Pr(Result<Box<PrPage>, String>),
+    /// A write finished: the new comment's or review's URL, or why it failed.
+    Written(Result<String, String>),
     /// The diff between two commits of an open PR.
     Diff {
         base: String,
@@ -75,6 +85,12 @@ pub enum Job {
         base: String,
         head: String,
     },
+    Write {
+        kind: WriteKind,
+        pr_id: String,
+        head_oid: String,
+        body: String,
+    },
     Open(String),
 }
 
@@ -83,6 +99,8 @@ pub struct App {
     pub inbox: Inbox,
     /// The PR opened from the Inbox, if any.
     pub pr: Option<PrView>,
+    /// A write being composed on the open PR.
+    pub compose: Option<Compose>,
     pub login: Option<String>,
     /// The account the cached Inbox belongs to, until sign-in confirms it.
     cached_login: Option<String>,
@@ -102,6 +120,7 @@ impl Default for App {
             view: View::Inbox,
             inbox: Inbox::default(),
             pr: None,
+            compose: None,
             login: None,
             cached_login: None,
             status: "Signing in…".into(),
@@ -143,6 +162,35 @@ impl App {
                 }
             }
             Action::Back => self.pr = None,
+            Action::Compose(kind) => match self.pr.as_ref().and_then(|pr| pr.page.as_ref()) {
+                Some(page) => self.compose = Some(Compose::new(kind, Target::of(page))),
+                None => self.status = "Wait for the PR to load before writing".into(),
+            },
+            Action::ComposePreview => {
+                if let Some(compose) = &mut self.compose {
+                    compose.preview();
+                }
+            }
+            Action::ComposeEdit => {
+                if let Some(compose) = &mut self.compose {
+                    compose.stage = Stage::Editing;
+                }
+            }
+            Action::ComposeCancel => self.compose = None,
+            Action::ComposeConfirm => {
+                if let Some(compose) = &mut self.compose
+                    && compose.stage == Stage::Preview
+                {
+                    compose.stage = Stage::Sending;
+                    compose.error = None;
+                    self.jobs.push(Job::Write {
+                        kind: compose.kind,
+                        pr_id: compose.target.pr_id.clone(),
+                        head_oid: compose.target.head_oid.clone(),
+                        body: compose.editor.text(),
+                    });
+                }
+            }
             Action::PrTab(tab) => {
                 if let Some(pr) = &mut self.pr {
                     pr.tab = tab;
@@ -266,6 +314,18 @@ impl App {
                 }
                 self.load_diff_if_needed();
             }
+            Message::Written(Ok(url)) => {
+                let kind = self.compose.take().map_or("Write", |c| c.kind.label());
+                self.status = format!("{kind} published: {url}");
+                self.dispatch(Action::Refresh);
+            }
+            Message::Written(Err(error)) => {
+                // The text stays so nothing typed is lost.
+                if let Some(compose) = &mut self.compose {
+                    compose.stage = Stage::Preview;
+                    compose.error = Some(error);
+                }
+            }
             Message::Diff { base, head, result } => {
                 if let Some(pr) = &mut self.pr
                     && pr
@@ -285,6 +345,28 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        if let Some(compose) = &mut self.compose {
+            let ctrl = key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+            let action = match (compose.stage, key.code) {
+                (_, KeyCode::Char('c')) if ctrl => Some(Action::ComposeCancel),
+                (Stage::Editing, KeyCode::Char('s')) if ctrl => Some(Action::ComposePreview),
+                (Stage::Editing, KeyCode::Esc) => Some(Action::ComposeCancel),
+                (Stage::Editing, _) => {
+                    compose.editor.key(key);
+                    None
+                }
+                (Stage::Preview, KeyCode::Enter) => Some(Action::ComposeConfirm),
+                (Stage::Preview, KeyCode::Char('s')) if ctrl => Some(Action::ComposeConfirm),
+                (Stage::Preview, KeyCode::Esc) => Some(Action::ComposeEdit),
+                _ => None,
+            };
+            if let Some(action) = action {
+                self.dispatch(action);
+            }
+            return;
+        }
         let action = keybar::resolve(&self.controls(), key).or(match key.code {
             KeyCode::Down | KeyCode::Char('j') => Some(Action::Move(1)),
             KeyCode::Up | KeyCode::Char('k') => Some(Action::Move(-1)),
@@ -294,6 +376,15 @@ impl App {
         });
         if let Some(action) = action {
             self.dispatch(action);
+        }
+    }
+
+    /// Pasted text goes into the compose box when it is being edited.
+    pub fn paste(&mut self, text: &str) {
+        if let Some(compose) = &mut self.compose
+            && compose.stage == Stage::Editing
+        {
+            compose.editor.insert(text);
         }
     }
 
@@ -327,6 +418,21 @@ impl App {
                 KeyCode::Char('w'),
                 "Web",
                 Action::OpenInBrowser,
+            ));
+            controls.push(Control::new(
+                KeyCode::Char('n'),
+                "Comment",
+                Action::Compose(WriteKind::Comment),
+            ));
+            controls.push(Control::new(
+                KeyCode::Char('A'),
+                "Approve",
+                Action::Compose(WriteKind::Approve),
+            ));
+            controls.push(Control::new(
+                KeyCode::Char('X'),
+                "Request changes",
+                Action::Compose(WriteKind::RequestChanges),
             ));
             controls.extend(
                 PrTab::ALL
@@ -393,6 +499,11 @@ impl App {
             .map_or(String::new(), |note| format!("  •  {note}"));
         frame.render_widget(Paragraph::new(format!(" {}{note}", self.status)), status);
         hits.extend(keybar::draw(frame, bar, &self.controls()));
+        // The compose box sits over everything; only its own buttons answer clicks.
+        if let Some(compose) = &self.compose {
+            let login = self.login.as_deref().unwrap_or("?");
+            hits = compose.draw(frame, body, login);
+        }
         self.hits = hits;
     }
 }
@@ -553,6 +664,79 @@ mod tests {
             }
             assert!(app.pr.is_none());
         }
+    }
+
+    #[test]
+    fn a_write_previews_its_exact_effect_and_sends_only_on_confirm() {
+        for by_click in [false, true] {
+            let mut app = signed_in();
+            press(&mut app, KeyCode::Enter);
+            app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+            app.jobs.clear();
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::Compose(WriteKind::RequestChanges));
+            } else {
+                press(&mut app, KeyCode::Char('X'));
+            }
+            app.paste("Please split\nthis PR");
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::ComposePreview);
+            } else {
+                app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            }
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("Request changes on o/a#1"), "{screen}");
+            assert!(screen.contains("As @octocat"), "{screen}");
+            assert!(app.jobs.is_empty(), "nothing is sent by the preview");
+            if by_click {
+                click(&mut app, &Action::ComposeConfirm);
+            } else {
+                press(&mut app, KeyCode::Enter);
+            }
+            assert_eq!(
+                app.jobs,
+                vec![Job::Write {
+                    kind: WriteKind::RequestChanges,
+                    pr_id: "PR_1".into(),
+                    head_oid: "a".repeat(40),
+                    body: "Please split\nthis PR".into(),
+                }]
+            );
+            app.jobs.clear();
+            // A failure keeps the text; a success closes the box and reloads the PR.
+            app.receive(Message::Written(Err("GitHub: no".into())));
+            let compose = app.compose.as_ref().unwrap();
+            assert_eq!(compose.editor.text(), "Please split\nthis PR");
+            assert_eq!(compose.error.as_deref(), Some("GitHub: no"));
+            app.receive(Message::Written(Ok(
+                "https://github.com/o/a/pull/1#r".into()
+            )));
+            assert!(app.compose.is_none());
+            assert!(matches!(
+                app.jobs.as_slice(),
+                [Job::LoadPr {
+                    updated_at: None,
+                    ..
+                }]
+            ));
+        }
+    }
+
+    #[test]
+    fn typing_in_the_compose_box_never_triggers_view_keys() {
+        let mut app = signed_in();
+        press(&mut app, KeyCode::Enter);
+        app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+        press(&mut app, KeyCode::Char('n'));
+        for c in "qbw".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(!app.quit && app.pr.is_some());
+        assert_eq!(app.compose.as_ref().unwrap().editor.text(), "qbw");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_none(), "Esc while editing cancels");
     }
 
     #[test]
