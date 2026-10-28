@@ -105,6 +105,7 @@ fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage 
     conversation.sort_by(|a, b| a.at.cmp(&b.at));
     let threads = nodes(pr.review_threads.nodes)
         .map(|thread| Thread {
+            id: thread.id,
             path: thread.path,
             line: thread.line,
             resolved: thread.is_resolved,

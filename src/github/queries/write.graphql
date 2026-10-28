@@ -16,3 +16,49 @@ mutation AddReview($pr: ID!, $commit: GitObjectID!, $event: PullRequestReviewEve
     }
   }
 }
+
+mutation AddLineComment(
+  $pr: ID!
+  $commit: GitObjectID!
+  $path: String!
+  $line: Int!
+  $side: DiffSide!
+  $body: String!
+) {
+  addPullRequestReview(
+    input: {
+      pullRequestId: $pr
+      commitOID: $commit
+      event: COMMENT
+      threads: [{ path: $path, line: $line, side: $side, body: $body }]
+    }
+  ) {
+    pullRequestReview {
+      url
+    }
+  }
+}
+
+mutation ReplyToThread($thread: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $thread, body: $body }) {
+    comment {
+      url
+    }
+  }
+}
+
+mutation ResolveThread($thread: ID!) {
+  resolveReviewThread(input: { threadId: $thread }) {
+    thread {
+      isResolved
+    }
+  }
+}
+
+mutation UnresolveThread($thread: ID!) {
+  unresolveReviewThread(input: { threadId: $thread }) {
+    thread {
+      isResolved
+    }
+  }
+}

@@ -48,11 +48,17 @@ pub struct Compose {
 
 impl Compose {
     pub fn new(kind: WriteKind, target: Target) -> Self {
+        // A write without text (resolving a thread) starts at its preview.
+        let stage = if kind.has_text() {
+            Stage::Editing
+        } else {
+            Stage::Preview
+        };
         Self {
             kind,
             target,
             editor: Editor::default(),
-            stage: Stage::Editing,
+            stage,
             error: None,
         }
     }
@@ -69,10 +75,23 @@ impl Compose {
 
     /// The preview: exactly what Confirm sends, where and as whom.
     pub fn preview_lines(&self, login: &str) -> Vec<Line<'static>> {
-        let effect = match self.kind {
-            WriteKind::Comment => "Add a comment to the conversation of",
-            WriteKind::Approve => "Approve",
-            WriteKind::RequestChanges => "Request changes on",
+        let effect = match &self.kind {
+            WriteKind::Comment => "Add a comment to the conversation of".to_string(),
+            WriteKind::Approve => "Approve".into(),
+            WriteKind::RequestChanges => "Request changes on".into(),
+            WriteKind::LineComment { path, line, side } => {
+                let side = if *side == crate::model::Side::Left {
+                    "old"
+                } else {
+                    "new"
+                };
+                format!("Comment on {path} line {line} ({side} side) of")
+            }
+            WriteKind::Reply { place, .. } => format!("Reply in the thread on {place} of"),
+            WriteKind::Resolve { place, resolve, .. } => {
+                let verb = if *resolve { "Resolve" } else { "Unresolve" };
+                format!("{verb} the review thread on {place} of")
+            }
         };
         let short = self.target.head_oid.chars().take(12).collect::<String>();
         let mut lines = vec![
@@ -83,15 +102,20 @@ impl Compose {
             Line::raw(self.target.title.clone()),
             Line::raw(format!("As @{login}")),
         ];
-        if self.kind != WriteKind::Comment {
+        if matches!(
+            self.kind,
+            WriteKind::Approve | WriteKind::RequestChanges | WriteKind::LineComment { .. }
+        ) {
             lines.push(Line::raw(format!("On head commit {short}")));
         }
-        lines.push(Line::raw(""));
-        let text = self.editor.text();
-        if text.trim().is_empty() {
-            lines.push(Line::raw("(no text)"));
+        if self.kind.has_text() {
+            lines.push(Line::raw(""));
+            let text = self.editor.text();
+            if text.trim().is_empty() {
+                lines.push(Line::raw("(no text)"));
+            }
+            lines.extend(text.lines().map(|line| Line::raw(format!("│ {line}"))));
         }
-        lines.extend(text.lines().map(|line| Line::raw(format!("│ {line}"))));
         lines.push(Line::raw(""));
         lines.push(Line::raw("Nothing is sent until you confirm."));
         lines
@@ -133,9 +157,13 @@ impl Compose {
                 ("Ctrl-S Preview", Action::ComposePreview),
                 ("Esc Cancel", Action::ComposeCancel),
             ],
-            Stage::Preview => &[
+            Stage::Preview if self.kind.has_text() => &[
                 ("Enter Confirm", Action::ComposeConfirm),
                 ("Esc Edit", Action::ComposeEdit),
+            ],
+            Stage::Preview => &[
+                ("Enter Confirm", Action::ComposeConfirm),
+                ("Esc Cancel", Action::ComposeCancel),
             ],
             Stage::Sending => &[],
         };

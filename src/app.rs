@@ -6,7 +6,7 @@ use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
 use crate::model::{PrPage, PullRequest, WriteKind};
-use crate::pr::{PrTab, PrView};
+use crate::pr::{Anchor, PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
@@ -40,6 +40,14 @@ pub enum Action {
     /// Leave the open PR.
     Back,
     PrTab(PrTab),
+    /// Put the PR view's cursor on anchor `i` (a diff line or a thread).
+    Cursor(usize),
+    /// Comment on the diff line under the cursor.
+    CommentLine,
+    /// Reply in the thread under the cursor.
+    ReplyThread,
+    /// Resolve or unresolve the thread under the cursor.
+    ToggleResolve,
     LocalTab(LocalTab),
     /// Start writing a comment or review on the open PR.
     Compose(WriteKind),
@@ -195,9 +203,27 @@ impl App {
             Action::Select(index) if index == self.inbox.selected => self.dispatch(Action::Open),
             Action::Select(index) => self.inbox.select(index),
             Action::Move(delta) => match &mut self.pr {
-                Some(pr) => pr.scroll_by(delta),
+                Some(pr) => pr.move_cursor(delta),
                 None => self.inbox.move_selection(delta),
             },
+            Action::Cursor(index) => {
+                if let Some(pr) = &mut self.pr {
+                    if pr.cursor == index {
+                        // A click on the line already under the cursor acts on it.
+                        match pr.tab {
+                            PrTab::Files => self.dispatch(Action::CommentLine),
+                            _ => self.dispatch(Action::ReplyThread),
+                        }
+                    } else {
+                        pr.cursor = index;
+                    }
+                }
+            }
+            Action::CommentLine | Action::ReplyThread | Action::ToggleResolve => {
+                if let Some(kind) = self.cursor_write(&action) {
+                    self.dispatch(Action::Compose(kind));
+                }
+            }
             Action::Open => {
                 if let Some(pr) = self.inbox.selected_pr().cloned() {
                     self.jobs.push(Job::LoadPr {
@@ -218,11 +244,12 @@ impl App {
                     compose.preview();
                 }
             }
-            Action::ComposeEdit => {
-                if let Some(compose) = &mut self.compose {
-                    compose.stage = Stage::Editing;
-                }
-            }
+            Action::ComposeEdit => match &mut self.compose {
+                // A write without text has nothing to edit: back means cancel.
+                Some(compose) if !compose.kind.has_text() => self.compose = None,
+                Some(compose) => compose.stage = Stage::Editing,
+                None => {}
+            },
             Action::ComposeCancel => self.compose = None,
             Action::ComposeConfirm => {
                 if let Some(compose) = &mut self.compose
@@ -231,7 +258,7 @@ impl App {
                     compose.stage = Stage::Sending;
                     compose.error = None;
                     self.jobs.push(Job::Write {
-                        kind: compose.kind,
+                        kind: compose.kind.clone(),
                         pr_id: compose.target.pr_id.clone(),
                         head_oid: compose.target.head_oid.clone(),
                         body: compose.editor.text(),
@@ -240,8 +267,7 @@ impl App {
             }
             Action::PrTab(tab) => {
                 if let Some(pr) = &mut self.pr {
-                    pr.tab = tab;
-                    pr.scroll = 0;
+                    pr.switch(tab);
                 }
                 self.load_diff_if_needed();
             }
@@ -292,6 +318,35 @@ impl App {
         self.inbox.open.fetched_at = Some(saved_at);
         self.inbox.open.cached = true;
         self.cached_login = Some(login);
+    }
+
+    /// The write `action` means for the anchor under the PR view's cursor, if it fits.
+    fn cursor_write(&self, action: &Action) -> Option<WriteKind> {
+        let pr = self.pr.as_ref()?;
+        let page = pr.page.as_ref()?;
+        match (action, pr.anchor()?) {
+            (Action::CommentLine, Anchor::Line(place)) => Some(WriteKind::LineComment {
+                path: place.path,
+                line: place.line,
+                side: place.side,
+            }),
+            (Action::ReplyThread, Anchor::Thread(index)) => {
+                let thread = page.threads.get(index)?;
+                Some(WriteKind::Reply {
+                    thread_id: thread.id.clone(),
+                    place: place(thread),
+                })
+            }
+            (Action::ToggleResolve, Anchor::Thread(index)) => {
+                let thread = page.threads.get(index)?;
+                Some(WriteKind::Resolve {
+                    thread_id: thread.id.clone(),
+                    place: place(thread),
+                    resolve: !thread.resolved,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Reads the checkout's history and changes again, unless a read is running.
@@ -388,7 +443,10 @@ impl App {
                 }
             }
             Message::Written(Ok(url)) => {
-                let kind = self.compose.take().map_or("Write", |c| c.kind.label());
+                let kind = self
+                    .compose
+                    .take()
+                    .map_or("Write".into(), |c| c.kind.label());
                 self.status = format!("{kind} published: {url}");
                 self.dispatch(Action::Refresh);
             }
@@ -507,6 +565,29 @@ impl App {
                 "Request changes",
                 Action::Compose(WriteKind::RequestChanges),
             ));
+            match self.pr.as_ref().and_then(|pr| Some((pr.tab, pr.anchor()?))) {
+                Some((PrTab::Files, Anchor::Line(_))) => controls.insert(
+                    0,
+                    Control::new(KeyCode::Char('i'), "Comment on line", Action::CommentLine),
+                ),
+                Some((PrTab::Conversation, Anchor::Thread(index))) => {
+                    let resolved = self
+                        .pr
+                        .as_ref()
+                        .and_then(|pr| pr.page.as_ref()?.threads.get(index))
+                        .is_some_and(|thread| thread.resolved);
+                    let label = if resolved { "Unresolve" } else { "Resolve" };
+                    controls.insert(
+                        0,
+                        Control::new(KeyCode::Char('R'), "Reply", Action::ReplyThread),
+                    );
+                    controls.insert(
+                        1,
+                        Control::new(KeyCode::Char('Z'), label, Action::ToggleResolve),
+                    );
+                }
+                _ => {}
+            }
             controls.extend(
                 PrTab::ALL
                     .iter()
@@ -585,6 +666,13 @@ impl App {
         }
         self.hits = hits;
     }
+}
+
+/// `path:line` of a review thread, for labels.
+fn place(thread: &crate::model::Thread) -> String {
+    thread.line.map_or(thread.path.clone(), |line| {
+        format!("{}:{line}", thread.path)
+    })
 }
 
 #[cfg(test)]
@@ -801,6 +889,89 @@ mod tests {
                 }]
             ));
         }
+    }
+
+    /// An app with PR o/a#1 open on `tab`, its page and (for Files) a small diff loaded.
+    fn open_pr(tab: PrTab) -> App {
+        let mut app = signed_in();
+        press(&mut app, KeyCode::Enter);
+        app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+        app.dispatch(Action::PrTab(tab));
+        app.receive(Message::Diff {
+            base: "b".repeat(40),
+            head: "a".repeat(40),
+            result: Ok(
+                "diff --git a/src/x.rs b/src/x.rs\n@@ -1,2 +1,2 @@\n keep\n-old\n+new".into(),
+            ),
+        });
+        app.jobs.clear();
+        app
+    }
+
+    #[test]
+    fn a_diff_line_takes_a_comment_by_key_or_by_clicking_it_twice() {
+        for by_click in [false, true] {
+            let mut app = open_pr(PrTab::Files);
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::Cursor(2));
+                draw(&mut app, 140);
+                click(&mut app, &Action::Cursor(2)); // the line under the cursor
+            } else {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Char('i'));
+            }
+            let compose = app.compose.as_ref().expect("compose box open");
+            assert_eq!(
+                compose.kind,
+                WriteKind::LineComment {
+                    path: "src/x.rs".into(),
+                    line: 2,
+                    side: crate::model::Side::Right
+                }
+            );
+            app.paste("Rename this");
+            app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(
+                screen.contains("Comment on src/x.rs line 2 (new side) of o/a#1"),
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn threads_take_replies_and_resolve_from_the_conversation_tab() {
+        let mut app = open_pr(PrTab::Conversation);
+        let bar = draw(&mut app, 140).join("\n");
+        assert!(
+            bar.contains("R Reply") && bar.contains("Z Resolve"),
+            "{bar}"
+        );
+        press(&mut app, KeyCode::Char('R'));
+        assert!(matches!(
+            &app.compose.as_ref().unwrap().kind,
+            WriteKind::Reply { thread_id, place } if thread_id == "T_1" && place == "src/x.rs:7"
+        ));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('Z'));
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(
+            compose.stage,
+            Stage::Preview,
+            "resolving has no text to write"
+        );
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(
+            screen.contains("Resolve the review thread on src/x.rs:7 of o/a#1"),
+            "{screen}"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.jobs[..],
+            [Job::Write { kind: WriteKind::Resolve { resolve: true, .. }, body, .. }] if body.is_empty()
+        ));
     }
 
     #[test]

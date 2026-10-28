@@ -28,6 +28,15 @@ impl PrTab {
     ];
 }
 
+/// A line the cursor can stop on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// The header of `page.threads[i]` (Conversation).
+    Thread(usize),
+    /// A diff line (Files).
+    Line(crate::diff::Place),
+}
+
 pub struct PrView {
     /// The Inbox row it was opened from (shown until the page arrives).
     pub summary: PullRequest,
@@ -38,6 +47,8 @@ pub struct PrView {
     pub error: Option<String>,
     pub tab: PrTab,
     pub scroll: u16,
+    /// Index into the current tab's anchors.
+    pub cursor: usize,
 }
 
 impl PrView {
@@ -51,7 +62,30 @@ impl PrView {
             error: None,
             tab: PrTab::Summary,
             scroll: 0,
+            cursor: 0,
         }
+    }
+
+    /// The anchor under the cursor, if the tab has any.
+    pub fn anchor(&self) -> Option<Anchor> {
+        let (_, anchors) = self.content();
+        anchors.get(self.cursor).map(|(_, anchor)| anchor.clone())
+    }
+
+    /// Moves the cursor between anchors; a tab without anchors scrolls instead.
+    pub fn move_cursor(&mut self, delta: isize) {
+        let count = self.content().1.len();
+        if count == 0 {
+            self.scroll_by(delta);
+        } else {
+            self.cursor = self.cursor.saturating_add_signed(delta).min(count - 1);
+        }
+    }
+
+    pub fn switch(&mut self, tab: PrTab) {
+        self.tab = tab;
+        self.scroll = 0;
+        self.cursor = 0;
     }
 
     pub fn url(&self) -> &str {
@@ -85,19 +119,54 @@ impl PrView {
             ])),
             title,
         );
-        let hits = self.draw_tabs(frame, tabs);
-        let lines = self.lines();
+        let mut hits = self.draw_tabs(frame, tabs);
+        let (mut lines, anchors) = self.content();
         let block = Block::default().borders(Borders::ALL);
-        let visible = block.inner(content).height;
-        let max = (lines.len() as u16).saturating_sub(visible);
-        self.scroll = self.scroll.min(max);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0))
-                .block(block),
-            content,
-        );
+        let inner = block.inner(content);
+        // The diff is not wrapped, so every diff line is one row and can be clicked.
+        let wrap = self.tab != PrTab::Files;
+        let width = usize::from(inner.width.max(1));
+        let rows = |line: &Line| {
+            if wrap {
+                line.width().div_ceil(width).max(1)
+            } else {
+                1
+            }
+        };
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut total = 0;
+        for line in &lines {
+            starts.push(total);
+            total += rows(line);
+        }
+        self.cursor = self.cursor.min(anchors.len().saturating_sub(1));
+        if let Some((line, _)) = anchors.get(self.cursor) {
+            // Keep the cursor's line on screen and mark it.
+            let row = starts[*line] as u16;
+            if row < self.scroll {
+                self.scroll = row;
+            } else if row >= self.scroll + inner.height {
+                self.scroll = row + 1 - inner.height;
+            }
+            lines[*line] = lines[*line]
+                .clone()
+                .style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        self.scroll = self.scroll.min((total as u16).saturating_sub(inner.height));
+        for (index, (line, _)) in anchors.iter().enumerate() {
+            let row = starts[*line] as u16;
+            if (self.scroll..self.scroll + inner.height).contains(&row) {
+                let rect = Rect::new(inner.x, inner.y + row - self.scroll, inner.width, 1);
+                hits.push((rect, Action::Cursor(index)));
+            }
+        }
+        let paragraph = Paragraph::new(lines).scroll((self.scroll, 0));
+        let paragraph = if wrap {
+            paragraph.wrap(Wrap { trim: false })
+        } else {
+            paragraph
+        };
+        frame.render_widget(paragraph.block(block), content);
         hits
     }
 
@@ -128,19 +197,26 @@ impl PrView {
         hits
     }
 
-    /// The current tab's content.
+    /// The current tab's lines.
+    #[cfg(test)]
     pub fn lines(&self) -> Vec<Line<'static>> {
+        self.content().0
+    }
+
+    /// The current tab's lines and the anchors among them (`(line index, anchor)`).
+    pub fn content(&self) -> (Vec<Line<'static>>, Vec<(usize, Anchor)>) {
         if let Some(error) = &self.error {
-            return vec![Line::raw(error.clone()), Line::raw("Press r to try again.")];
+            let lines = vec![Line::raw(error.clone()), Line::raw("Press r to try again.")];
+            return (lines, Vec::new());
         }
         let Some(page) = &self.page else {
-            return vec![Line::raw("Loading…")];
+            return (vec![Line::raw("Loading…")], Vec::new());
         };
         match self.tab {
-            PrTab::Summary => summary(page),
+            PrTab::Summary => (summary(page), Vec::new()),
             PrTab::Conversation => conversation(page),
             PrTab::Files => files(page, self.diff.as_deref(), self.diff_loading),
-            PrTab::Checks => checks(page),
+            PrTab::Checks => (checks(page), Vec::new()),
         }
     }
 }
@@ -209,11 +285,12 @@ fn entry(lines: &mut Vec<Line<'static>>, entry: &Entry, indent: &str) {
     lines.push(Line::raw(""));
 }
 
-fn conversation(page: &PrPage) -> Vec<Line<'static>> {
+fn conversation(page: &PrPage) -> (Vec<Line<'static>>, Vec<(usize, Anchor)>) {
     if page.conversation.is_empty() && page.threads.is_empty() {
-        return vec![Line::raw("No comments or reviews yet")];
+        return (vec![Line::raw("No comments or reviews yet")], Vec::new());
     }
     let mut lines = Vec::new();
+    let mut anchors = Vec::new();
     for item in &page.conversation {
         entry(&mut lines, item, "");
     }
@@ -221,18 +298,23 @@ fn conversation(page: &PrPage) -> Vec<Line<'static>> {
         lines.push(bold(format!("REVIEW THREADS ({})", page.threads.len())));
         lines.push(Line::raw(""));
     }
-    for thread in &page.threads {
+    for (index, thread) in page.threads.iter().enumerate() {
         let line = thread.line.map_or(String::new(), |line| format!(":{line}"));
         let resolved = if thread.resolved { " · resolved" } else { "" };
+        anchors.push((lines.len(), Anchor::Thread(index)));
         lines.push(bold(format!("{}{line}{resolved}", thread.path)));
         for comment in &thread.comments {
             entry(&mut lines, comment, "  ");
         }
     }
-    lines
+    (lines, anchors)
 }
 
-fn files(page: &PrPage, diff: Option<&str>, loading: bool) -> Vec<Line<'static>> {
+fn files(
+    page: &PrPage,
+    diff: Option<&str>,
+    loading: bool,
+) -> (Vec<Line<'static>>, Vec<(usize, Anchor)>) {
     let mut lines = vec![bold(format!(
         "{} files · +{} −{}",
         page.changed_files, page.additions, page.deletions
@@ -244,12 +326,21 @@ fn files(page: &PrPage, diff: Option<&str>, loading: bool) -> Vec<Line<'static>>
         )));
     }
     lines.push(Line::raw(""));
+    let mut anchors = Vec::new();
     match diff {
-        Some(diff) => lines.extend(crate::diff::lines(diff)),
+        Some(diff) => {
+            let start = lines.len();
+            for (offset, place) in crate::diff::places(diff).into_iter().enumerate() {
+                if let Some(place) = place {
+                    anchors.push((start + offset, Anchor::Line(place)));
+                }
+            }
+            lines.extend(crate::diff::lines(diff));
+        }
         None if loading => lines.push(Line::raw("Loading the diff…")),
         None => lines.push(Line::raw("The diff is not loaded. Press r to load it.")),
     }
-    lines
+    (lines, anchors)
 }
 
 fn checks(page: &PrPage) -> Vec<Line<'static>> {
@@ -310,6 +401,7 @@ pub(crate) mod tests {
                 review: Some(Stance::Reviewed),
             }],
             threads: vec![Thread {
+                id: "T_1".into(),
                 path: "src/x.rs".into(),
                 line: Some(7),
                 resolved: false,

@@ -223,7 +223,7 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 head_oid,
                 body,
             } => Message::Written(client().and_then(|c| {
-                github::write::publish(&c, kind, &pr_id, &head_oid, &body).map_err(text)
+                github::write::publish(&c, &kind, &pr_id, &head_oid, &body).map_err(text)
             })),
             Job::Open(url) => {
                 let opener = if cfg!(target_os = "macos") {

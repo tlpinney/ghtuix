@@ -48,6 +48,7 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
       }
       reviewThreads(first: 50) {
         nodes {
+          id
           isResolved
           path
           line

@@ -52,26 +52,61 @@ impl Stance {
     }
 }
 
+/// Which side of a diff a line is on: the base (`Left`) or the head (`Right`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Side {
+    Left,
+    Right,
+}
+
 /// What a write does to a pull request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteKind {
     Comment,
     Approve,
     RequestChanges,
+    /// A review comment on one line of the diff.
+    LineComment {
+        path: String,
+        line: i64,
+        side: Side,
+    },
+    /// A reply in an existing review thread.
+    Reply {
+        thread_id: String,
+        place: String,
+    },
+    /// Resolve (or, with `false`, unresolve) a review thread.
+    Resolve {
+        thread_id: String,
+        place: String,
+        resolve: bool,
+    },
 }
 
 impl WriteKind {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Self::Comment => "Comment",
-            Self::Approve => "Approve",
-            Self::RequestChanges => "Request changes",
+            Self::Comment => "Comment".into(),
+            Self::Approve => "Approve".into(),
+            Self::RequestChanges => "Request changes".into(),
+            Self::LineComment { path, line, .. } => format!("Comment on {path}:{line}"),
+            Self::Reply { place, .. } => format!("Reply on {place}"),
+            Self::Resolve { place, resolve, .. } => {
+                let verb = if *resolve { "Resolve" } else { "Unresolve" };
+                format!("{verb} the thread on {place}")
+            }
         }
     }
 
+    /// Whether the write has text at all (resolving a thread has none).
+    pub fn has_text(&self) -> bool {
+        !matches!(self, Self::Resolve { .. })
+    }
+
     /// Whether the text may be empty (an approval needs no words).
-    pub fn body_optional(self) -> bool {
-        self == Self::Approve
+    pub fn body_optional(&self) -> bool {
+        matches!(self, Self::Approve | Self::Resolve { .. })
     }
 }
 
@@ -146,6 +181,8 @@ pub struct Entry {
 /// A review thread on a line of a changed file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thread {
+    /// GitHub's node id, which replies and resolving address.
+    pub id: String,
     pub path: String,
     pub line: Option<i64>,
     pub resolved: bool,
