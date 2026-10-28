@@ -1,8 +1,10 @@
 //! Application state and the one dispatch path for keys, clicks and background results.
 
 use crate::compose::{Compose, Stage, Target};
+use crate::git::{GraphLine, Repo};
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
+use crate::local::{Changes, Local, LocalTab};
 use crate::model::{PrPage, PullRequest, WriteKind};
 use crate::pr::{PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -11,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 
 /// The top-level views.
@@ -38,6 +40,7 @@ pub enum Action {
     /// Leave the open PR.
     Back,
     PrTab(PrTab),
+    LocalTab(LocalTab),
     /// Start writing a comment or review on the open PR.
     Compose(WriteKind),
     ComposePreview,
@@ -57,6 +60,13 @@ pub enum Message {
     Inbox(Result<Vec<PullRequest>, String>),
     Merged(Result<Vec<PullRequest>, String>),
     Pr(Result<Box<PrPage>, String>),
+    History(Result<Vec<GraphLine>, String>),
+    Changes(Result<Changes, String>),
+    /// `git show` of one commit.
+    Commit {
+        sha: String,
+        result: Result<String, String>,
+    },
     /// A write finished: the new comment's or review's URL, or why it failed.
     Written(Result<String, String>),
     /// The diff between two commits of an open PR.
@@ -85,6 +95,9 @@ pub enum Job {
         base: String,
         head: String,
     },
+    LoadHistory(Repo),
+    LoadChanges(Repo),
+    ShowCommit(Repo, String),
     Write {
         kind: WriteKind,
         pr_id: String,
@@ -101,6 +114,7 @@ pub struct App {
     pub pr: Option<PrView>,
     /// A write being composed on the open PR.
     pub compose: Option<Compose>,
+    pub local: Local,
     pub login: Option<String>,
     /// The account the cached Inbox belongs to, until sign-in confirms it.
     cached_login: Option<String>,
@@ -121,6 +135,7 @@ impl Default for App {
             inbox: Inbox::default(),
             pr: None,
             compose: None,
+            local: Local::new(Err("No checkout yet".into())),
             login: None,
             cached_login: None,
             status: "Signing in…".into(),
@@ -136,7 +151,39 @@ impl App {
     /// The single entry point for every action.
     pub fn dispatch(&mut self, action: Action) {
         match action {
-            Action::Show(view) => self.view = view,
+            Action::Show(view) => {
+                self.view = view;
+                if view == View::Local && self.local.history.is_none() {
+                    self.load_local();
+                }
+            }
+            Action::LocalTab(tab) => {
+                self.local.tab = tab;
+                self.local.commit = None;
+                self.local.scroll = 0;
+            }
+            Action::Select(index) if self.view == View::Local => {
+                if index == self.local.selected {
+                    self.dispatch(Action::Open);
+                } else {
+                    self.local.selected = index;
+                }
+            }
+            Action::Move(delta) if self.view == View::Local => {
+                if self.local.tab == LocalTab::History && self.local.commit.is_none() {
+                    self.local.move_selection(delta);
+                } else {
+                    self.local.scroll_by(delta);
+                }
+            }
+            Action::Open if self.view == View::Local => {
+                if let (Ok(repo), Some(sha)) = (&self.local.repo, self.local.selected_sha()) {
+                    self.jobs.push(Job::ShowCommit(repo.clone(), sha.clone()));
+                    self.local.commit = Some((sha, None));
+                    self.local.scroll = 0;
+                }
+            }
+            Action::Back if self.view == View::Local => self.local.commit = None,
             Action::Tab(tab) => {
                 self.inbox.tab = tab;
                 self.inbox.select(0);
@@ -225,6 +272,8 @@ impl App {
                             updated_at: None,
                         });
                     }
+                } else if self.view == View::Local {
+                    self.load_local();
                 } else if self.login.is_none() {
                     self.jobs.push(Job::SignIn);
                 } else if self.inbox.tab == Tab::Merged {
@@ -243,6 +292,17 @@ impl App {
         self.inbox.open.fetched_at = Some(saved_at);
         self.inbox.open.cached = true;
         self.cached_login = Some(login);
+    }
+
+    /// Reads the checkout's history and changes again, unless a read is running.
+    fn load_local(&mut self) {
+        if let Ok(repo) = &self.local.repo
+            && !self.local.loading
+        {
+            self.local.loading = true;
+            self.jobs.push(Job::LoadHistory(repo.clone()));
+            self.jobs.push(Job::LoadChanges(repo.clone()));
+        }
     }
 
     /// Asks for the open PR's diff when its Files tab shows and the diff is missing.
@@ -313,6 +373,19 @@ impl App {
                     }
                 }
                 self.load_diff_if_needed();
+            }
+            Message::History(result) => {
+                self.local.loading = false;
+                self.local.history = Some(result);
+                self.local.move_selection(0);
+            }
+            Message::Changes(result) => self.local.changes = Some(result),
+            Message::Commit { sha, result } => {
+                if let Some((open, shown)) = &mut self.local.commit
+                    && *open == sha
+                {
+                    *shown = Some(result.unwrap_or_else(|error| error));
+                }
             }
             Message::Written(Ok(url)) => {
                 let kind = self.compose.take().map_or("Write", |c| c.kind.label());
@@ -451,6 +524,19 @@ impl App {
                     .iter()
                     .map(|(tab, key, _)| Control::hidden(KeyCode::Char(*key), Action::Tab(*tab))),
             );
+        } else if self.view == View::Local {
+            if self.local.commit.is_some() {
+                controls.push(Control::new(KeyCode::Char('b'), "Back", Action::Back));
+                controls.push(Control::hidden(KeyCode::Left, Action::Back));
+                controls.push(Control::hidden(KeyCode::Esc, Action::Back));
+            } else if self.local.tab == LocalTab::History {
+                controls.push(Control::new(KeyCode::Enter, "Show commit", Action::Open));
+            }
+            controls.extend(
+                LocalTab::ALL.iter().map(|(tab, key, _)| {
+                    Control::hidden(KeyCode::Char(*key), Action::LocalTab(*tab))
+                }),
+            );
         }
         controls.push(Control::new(KeyCode::Char('r'), "Refresh", Action::Refresh));
         controls.extend(View::ALL.iter().map(|(view, key, label)| {
@@ -484,14 +570,7 @@ impl App {
                 Some(pr) => pr.draw(frame, body),
                 None => self.inbox.draw(frame, body),
             },
-            View::Local => {
-                frame.render_widget(
-                    Paragraph::new(" Local Git comes in a later step.")
-                        .block(Block::default().borders(Borders::ALL).title(" Local ")),
-                    body,
-                );
-                Vec::new()
-            }
+            View::Local => self.local.draw(frame, body),
         };
         let note = self
             .api_note
@@ -737,6 +816,46 @@ mod tests {
         assert_eq!(app.compose.as_ref().unwrap().editor.text(), "qbw");
         press(&mut app, KeyCode::Esc);
         assert!(app.compose.is_none(), "Esc while editing cancels");
+    }
+
+    #[test]
+    fn local_history_loads_on_first_visit_and_shows_a_commit_by_key_or_click() {
+        for by_click in [false, true] {
+            let mut app = App {
+                local: Local::new(Ok(Repo {
+                    root: "/tmp/repo".into(),
+                })),
+                jobs: Vec::new(),
+                ..App::default()
+            };
+            press(&mut app, KeyCode::Char('2'));
+            assert_eq!(app.jobs.len(), 2, "history and changes load together");
+            app.jobs.clear();
+            app.receive(Message::History(Ok(crate::local::tests::history())));
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(
+                screen.contains("Second") && screen.contains("aaaaaaaa"),
+                "{screen}"
+            );
+            if by_click {
+                click(&mut app, &Action::Select(2));
+                click(&mut app, &Action::Select(2)); // the selected row opens
+            } else {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Enter);
+            }
+            let sha = "b".repeat(40);
+            assert!(matches!(&app.jobs[..], [Job::ShowCommit(_, s)] if *s == sha));
+            app.receive(Message::Commit {
+                sha: sha.clone(),
+                result: Ok("commit bbbb\n+line".into()),
+            });
+            assert!(draw(&mut app, 120).join("\n").contains("+line"));
+            press(&mut app, KeyCode::Char('b'));
+            assert!(app.local.commit.is_none());
+            press(&mut app, KeyCode::Char('i'));
+            assert_eq!(app.local.tab, LocalTab::Staged);
+        }
     }
 
     #[test]

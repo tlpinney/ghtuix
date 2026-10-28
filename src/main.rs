@@ -2,10 +2,13 @@ mod app;
 mod cache;
 mod compose;
 mod config;
+mod diff;
 mod editor;
+mod git;
 mod github;
 mod inbox;
 mod keybar;
+mod local;
 mod model;
 mod pr;
 mod time;
@@ -44,6 +47,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
     let host: Arc<str> = config.host().into();
     let mut app = App::default();
     app.inbox.hidden = config.excluded_repositories;
+    app.local = local::Local::new(
+        std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|dir| git::Repo::discover(&dir))
+            .map_err(|_| "Not inside a Git checkout: start ghtuix in one to see it here".into()),
+    );
     // A cache that cannot open only costs the instant start.
     let cache = cache::path().and_then(|path| cache::Cache::open(&path).ok());
     if let Some(cache) = &cache
@@ -191,6 +200,22 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
             Job::LoadMerged => {
                 Message::Merged(client().and_then(|c| github::inbox::merged(&c).map_err(text)))
             }
+            Job::LoadHistory(repo) => Message::History(repo.history(500).map_err(text)),
+            Job::LoadChanges(repo) => Message::Changes(
+                repo.status()
+                    .and_then(|status| {
+                        Ok(local::Changes {
+                            status,
+                            working: repo.working_diff()?,
+                            staged: repo.staged_diff()?,
+                        })
+                    })
+                    .map_err(text),
+            ),
+            Job::ShowCommit(repo, sha) => Message::Commit {
+                result: repo.show(&sha).map_err(text),
+                sha,
+            },
             Job::Write {
                 kind,
                 pr_id,

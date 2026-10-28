@@ -262,27 +262,11 @@ fn files(page: &PrPage, diff: Option<&str>, loading: bool) -> Vec<Line<'static>>
     }
     lines.push(Line::raw(""));
     match diff {
-        Some(diff) => lines.extend(diff.lines().map(diff_line)),
+        Some(diff) => lines.extend(crate::diff::lines(diff)),
         None if loading => lines.push(Line::raw("Loading the diff…")),
         None => lines.push(Line::raw("The diff is not loaded. Press r to load it.")),
     }
     lines
-}
-
-/// One diff line, coloured by what it is.
-fn diff_line(line: &str) -> Line<'static> {
-    let style = if line.starts_with("diff --git") {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else if line.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
-    } else if line.starts_with('+') && !line.starts_with("+++") {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default()
-    };
-    Line::styled(line.replace('\t', "    "), style)
 }
 
 fn checks(page: &PrPage) -> Vec<Line<'static>> {
