@@ -21,9 +21,120 @@ type GitObjectID = String;
 )]
 struct PrPage;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "schema/github.graphql",
+    query_path = "src/github/queries/pr.graphql",
+    response_derives = "Debug"
+)]
+struct PrMore;
+
 use pr_page::*;
 
-/// Reads `repo#number` (`repo` is `owner/name`).
+/// Most follow-up pages read for one PR (each brings up to 100 more of every list).
+const MAX_MORE: usize = 10;
+
+/// Where each long list of a PR continues: `(more to read, cursor after the last read)`.
+#[derive(Clone, Debug, Default)]
+struct Cursors {
+    comments: (bool, Option<String>),
+    reviews: (bool, Option<String>),
+    threads: (bool, Option<String>),
+    files: (bool, Option<String>),
+}
+
+impl Cursors {
+    fn more(&self) -> bool {
+        self.comments.0 || self.reviews.0 || self.threads.0 || self.files.0
+    }
+}
+
+/// The page info of a connection as `(has next page, end cursor)`.
+macro_rules! cursor {
+    ($connection:expr) => {
+        (
+            $connection.page_info.has_next_page,
+            $connection.page_info.end_cursor.clone(),
+        )
+    };
+}
+
+/// Converting the shared fragments, for each query's generated copy of them.
+macro_rules! fragment_conversions {
+    ($m:ident) => {
+        pub(super) fn comment(c: super::$m::CommentNode) -> Entry {
+            use super::$m::CommentNodeAuthorOn as On;
+            Entry {
+                author: c
+                    .author
+                    .map_or_else(ghost, |a| person(a.login, matches!(a.on, On::Bot))),
+                body: c.body,
+                at: c.created_at,
+                review: None,
+            }
+        }
+
+        pub(super) fn review(r: super::$m::ReviewNode) -> Option<Entry> {
+            use super::$m::{PullRequestReviewState as S, ReviewNodeAuthorOn as On};
+            let stance = match r.state {
+                S::APPROVED => Stance::Approved,
+                S::CHANGES_REQUESTED => Stance::ChangesRequested,
+                S::DISMISSED => Stance::Dismissed,
+                S::COMMENTED => Stance::Reviewed,
+                _ => return None,
+            };
+            Some(Entry {
+                author: r
+                    .author
+                    .map_or_else(ghost, |a| person(a.login, matches!(a.on, On::Bot))),
+                body: r.body,
+                at: r.submitted_at.unwrap_or_default(),
+                review: Some(stance),
+            })
+        }
+
+        pub(super) fn thread(t: super::$m::ThreadNode) -> Thread {
+            use super::$m::ThreadNodeCommentsNodesAuthorOn as On;
+            Thread {
+                id: t.id,
+                path: t.path,
+                line: t.line,
+                resolved: t.is_resolved,
+                comments: nodes(t.comments.nodes)
+                    .map(|c| Entry {
+                        author: c
+                            .author
+                            .map_or_else(ghost, |a| person(a.login, matches!(a.on, On::Bot))),
+                        body: c.body,
+                        at: c.created_at,
+                        review: None,
+                    })
+                    .collect(),
+            }
+        }
+
+        pub(super) fn file(f: super::$m::FileNode) -> FileChange {
+            FileChange {
+                path: f.path,
+                additions: f.additions,
+                deletions: f.deletions,
+                change: format!("{:?}", f.change_type).to_lowercase(),
+            }
+        }
+    };
+}
+
+mod page_nodes {
+    use super::*;
+    fragment_conversions!(pr_page);
+}
+
+mod more_nodes {
+    use super::*;
+    fragment_conversions!(pr_more);
+}
+
+/// Reads `repo#number` (`repo` is `owner/name`), following every long list to its end.
 pub fn page(client: &Client, repo: &str, number: i64) -> Result<crate::model::PrPage> {
     let (owner, name) = repo
         .split_once('/')
@@ -47,7 +158,65 @@ pub fn page(client: &Client, repo: &str, number: i64) -> Result<crate::model::Pr
     let pr = repository
         .pull_request
         .ok_or_else(|| anyhow!("{repo}#{number} is not visible to this account"))?;
-    Ok(convert(repo, pr, methods))
+    let (mut page, mut cursors) = convert(repo, pr, methods);
+    for _ in 0..MAX_MORE {
+        if !cursors.more() {
+            break;
+        }
+        cursors = more(client, owner, name, number, &cursors, &mut page)?;
+    }
+    page.conversation.sort_by(|a, b| a.at.cmp(&b.at));
+    Ok(page)
+}
+
+/// Reads the next page of every list that has one, adding them to `page`.
+fn more(
+    client: &Client,
+    owner: &str,
+    name: &str,
+    number: i64,
+    cursors: &Cursors,
+    page: &mut crate::model::PrPage,
+) -> Result<Cursors> {
+    let data = client.graphql::<PrMore>(pr_more::Variables {
+        owner: owner.into(),
+        name: name.into(),
+        number,
+        comments: cursors.comments.1.clone(),
+        reviews: cursors.reviews.1.clone(),
+        threads: cursors.threads.1.clone(),
+        files: cursors.files.1.clone(),
+    })?;
+    let pr = data
+        .repository
+        .and_then(|repository| repository.pull_request)
+        .ok_or_else(|| anyhow!("The PR went away while its pages were read"))?;
+    let mut next = cursors.clone();
+    // Only lists that still had pages take what came back.
+    if cursors.comments.0 {
+        next.comments = cursor!(pr.comments);
+        page.conversation
+            .extend(nodes(pr.comments.nodes).map(more_nodes::comment));
+    }
+    if cursors.reviews.0
+        && let Some(reviews) = pr.reviews
+    {
+        next.reviews = cursor!(reviews);
+        page.conversation
+            .extend(nodes(reviews.nodes).filter_map(more_nodes::review));
+    }
+    if cursors.threads.0 {
+        next.threads = cursor!(pr.review_threads);
+        page.threads
+            .extend(nodes(pr.review_threads.nodes).map(more_nodes::thread));
+    }
+    if cursors.files.0
+        && let Some(files) = pr.files
+    {
+        next.files = cursor!(files);
+        page.files.extend(nodes(files.nodes).map(more_nodes::file));
+    }
+    Ok(next)
 }
 
 /// The log of a GitHub Actions job: GitHub redirects to short-lived blob storage, and the
@@ -75,90 +244,41 @@ fn person(login: String, bot: bool) -> Person {
     Person { login, bot }
 }
 
+fn ghost() -> Person {
+    person("ghost".into(), false)
+}
+
 fn convert(
     repo: &str,
     pr: PrPageRepositoryPullRequest,
     merge_methods: Vec<MergeMethod>,
-) -> crate::model::PrPage {
-    let author = pr.author.map_or_else(
-        || person("ghost".into(), false),
-        |a| {
-            person(
-                a.login,
-                matches!(a.on, PrPageRepositoryPullRequestAuthorOn::Bot),
-            )
-        },
-    );
-    let mut conversation: Vec<Entry> = Vec::new();
-    for comment in nodes(pr.comments.nodes) {
-        let who = comment.author.map_or_else(
-            || person("ghost".into(), false),
-            |a| {
-                let bot = matches!(a.on, PrPageRepositoryPullRequestCommentsNodesAuthorOn::Bot);
-                person(a.login, bot)
-            },
-        );
-        conversation.push(Entry {
-            author: who,
-            body: comment.body,
-            at: comment.created_at,
-            review: None,
-        });
+) -> (crate::model::PrPage, Cursors) {
+    let author = pr.author.map_or_else(ghost, |a| {
+        person(
+            a.login,
+            matches!(a.on, PrPageRepositoryPullRequestAuthorOn::Bot),
+        )
+    });
+    let mut cursors = Cursors {
+        comments: cursor!(pr.comments),
+        threads: cursor!(pr.review_threads),
+        ..Cursors::default()
+    };
+    let mut conversation: Vec<Entry> = nodes(pr.comments.nodes).map(page_nodes::comment).collect();
+    if let Some(reviews) = pr.reviews {
+        cursors.reviews = cursor!(reviews);
+        conversation.extend(nodes(reviews.nodes).filter_map(page_nodes::review));
     }
-    for review in nodes(pr.reviews.and_then(|reviews| reviews.nodes)) {
-        let stance = match review.state {
-            PullRequestReviewState::APPROVED => Stance::Approved,
-            PullRequestReviewState::CHANGES_REQUESTED => Stance::ChangesRequested,
-            PullRequestReviewState::DISMISSED => Stance::Dismissed,
-            PullRequestReviewState::COMMENTED => Stance::Reviewed,
-            _ => continue,
-        };
-        let who = review.author.map_or_else(
-            || person("ghost".into(), false),
-            |a| {
-                let bot = matches!(a.on, PrPageRepositoryPullRequestReviewsNodesAuthorOn::Bot);
-                person(a.login, bot)
-            },
-        );
-        conversation.push(Entry {
-            author: who,
-            body: review.body,
-            at: review.submitted_at.unwrap_or_default(),
-            review: Some(stance),
-        });
-    }
-    conversation.sort_by(|a, b| a.at.cmp(&b.at));
     let threads = nodes(pr.review_threads.nodes)
-        .map(|thread| Thread {
-            id: thread.id,
-            path: thread.path,
-            line: thread.line,
-            resolved: thread.is_resolved,
-            comments: nodes(thread.comments.nodes)
-                .map(|comment| Entry {
-                    author: comment.author.map_or_else(
-                        || person("ghost".into(), false),
-                        |a| {
-                            use PrPageRepositoryPullRequestReviewThreadsNodesCommentsNodesAuthorOn as On;
-                            let bot = matches!(a.on, On::Bot);
-                            person(a.login, bot)
-                        },
-                    ),
-                    body: comment.body,
-                    at: comment.created_at,
-                    review: None,
-                })
-                .collect(),
-        })
+        .map(page_nodes::thread)
         .collect();
-    let files = nodes(pr.files.and_then(|files| files.nodes))
-        .map(|file| FileChange {
-            path: file.path,
-            additions: file.additions,
-            deletions: file.deletions,
-            change: format!("{:?}", file.change_type).to_lowercase(),
-        })
-        .collect();
+    let files = match pr.files {
+        Some(files) => {
+            cursors.files = cursor!(files);
+            nodes(files.nodes).map(page_nodes::file).collect()
+        }
+        None => Vec::new(),
+    };
     let rollup = nodes(pr.commits.nodes)
         .next()
         .and_then(|node| node.commit.status_check_rollup);
@@ -171,7 +291,7 @@ fn convert(
         Some(PullRequestReviewDecision::REVIEW_REQUIRED) => Decision::Required,
         _ => Decision::None,
     };
-    crate::model::PrPage {
+    let page = crate::model::PrPage {
         id: pr.id,
         repo: repo.into(),
         number: pr.number,
@@ -198,7 +318,8 @@ fn convert(
         threads,
         files,
         checks,
-    }
+    };
+    (page, cursors)
 }
 
 fn check(

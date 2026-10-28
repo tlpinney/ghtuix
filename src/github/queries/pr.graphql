@@ -30,50 +30,39 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
       mergeStateStatus
       reviewDecision
       comments(first: 100) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
-          author {
-            __typename
-            login
-          }
-          body
-          createdAt
+          ...CommentNode
         }
       }
       reviews(first: 50) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
-          author {
-            __typename
-            login
-          }
-          state
-          body
-          submittedAt
+          ...ReviewNode
         }
       }
       reviewThreads(first: 50) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
-          id
-          isResolved
-          path
-          line
-          comments(first: 20) {
-            nodes {
-              author {
-                __typename
-                login
-              }
-              body
-              createdAt
-            }
-          }
+          ...ThreadNode
         }
       }
       files(first: 100) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
-          path
-          additions
-          deletions
-          changeType
+          ...FileNode
         }
       }
       commits(last: 1) {
@@ -109,4 +98,100 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
       }
     }
   }
+}
+
+# The next page of each long list of a PR. A list already complete passes its last cursor
+# and comes back empty, so one query continues all four at once.
+query PrMore(
+  $owner: String!
+  $name: String!
+  $number: Int!
+  $comments: String
+  $reviews: String
+  $threads: String
+  $files: String
+) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(first: 100, after: $comments) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          ...CommentNode
+        }
+      }
+      reviews(first: 50, after: $reviews) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          ...ReviewNode
+        }
+      }
+      reviewThreads(first: 50, after: $threads) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          ...ThreadNode
+        }
+      }
+      files(first: 100, after: $files) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          ...FileNode
+        }
+      }
+    }
+  }
+}
+
+fragment CommentNode on IssueComment {
+  author {
+    __typename
+    login
+  }
+  body
+  createdAt
+}
+
+fragment ReviewNode on PullRequestReview {
+  author {
+    __typename
+    login
+  }
+  state
+  body
+  submittedAt
+}
+
+fragment ThreadNode on PullRequestReviewThread {
+  id
+  isResolved
+  path
+  line
+  comments(first: 50) {
+    nodes {
+      author {
+        __typename
+        login
+      }
+      body
+      createdAt
+    }
+  }
+}
+
+fragment FileNode on PullRequestChangedFile {
+  path
+  additions
+  deletions
+  changeType
 }

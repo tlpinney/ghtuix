@@ -1,6 +1,10 @@
 # The Inbox: open PRs in three queues, one request (aliased searches).
 query Inbox($authored: String!, $assigned: String!, $review: String!) {
   authored: search(query: $authored, type: ISSUE, first: 50) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
     nodes {
       __typename
       ... on PullRequest {
@@ -9,6 +13,10 @@ query Inbox($authored: String!, $assigned: String!, $review: String!) {
     }
   }
   assigned: search(query: $assigned, type: ISSUE, first: 50) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
     nodes {
       __typename
       ... on PullRequest {
@@ -17,6 +25,26 @@ query Inbox($authored: String!, $assigned: String!, $review: String!) {
     }
   }
   review: search(query: $review, type: ISSUE, first: 50) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      __typename
+      ... on PullRequest {
+        ...Pr
+      }
+    }
+  }
+}
+
+# The next page of one queue's search.
+query InboxMore($query: String!, $after: String) {
+  search(query: $query, type: ISSUE, first: 50, after: $after) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
     nodes {
       __typename
       ... on PullRequest {
@@ -27,8 +55,12 @@ query Inbox($authored: String!, $assigned: String!, $review: String!) {
 }
 
 # Recently merged PRs that involve the viewer (the Merged tab, read on demand).
-query Merged($query: String!) {
-  search(query: $query, type: ISSUE, first: 50) {
+query Merged($query: String!, $after: String) {
+  search(query: $query, type: ISSUE, first: 50, after: $after) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
     nodes {
       __typename
       ... on PullRequest {

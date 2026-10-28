@@ -26,6 +26,26 @@ struct Inbox;
 )]
 struct Merged;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "schema/github.graphql",
+    query_path = "src/github/queries/inbox.graphql",
+    response_derives = "Debug"
+)]
+struct InboxMore;
+
+/// GitHub search returns at most 1,000 results: 20 pages of 50.
+const MAX_PAGES: usize = 20;
+
+/// One queue's search as it is read page by page.
+struct QueueRead {
+    queue: Queue,
+    query: String,
+    prs: Vec<PullRequest>,
+    more: bool,
+    cursor: Option<String>,
+}
+
 /// Days the Merged tab looks back.
 pub const MERGED_DAYS: i64 = 7;
 
@@ -37,20 +57,54 @@ pub fn open(client: &Client) -> Result<Vec<PullRequest>> {
         assigned: search("assignee"),
         review: search("review-requested"),
     })?;
-    let queues = [
-        (
+    let read = |queue, qualifier: &str, prs: Vec<PullRequest>, more, cursor| QueueRead {
+        queue,
+        query: search(qualifier),
+        prs,
+        more,
+        cursor,
+    };
+    let mut queues = [
+        read(
             Queue::Authored,
+            "author",
             nodes(data.authored.nodes).filter_map(authored).collect(),
+            data.authored.page_info.has_next_page,
+            data.authored.page_info.end_cursor,
         ),
-        (
+        read(
             Queue::Assigned,
+            "assignee",
             nodes(data.assigned.nodes).filter_map(assigned).collect(),
+            data.assigned.page_info.has_next_page,
+            data.assigned.page_info.end_cursor,
         ),
-        (
+        read(
             Queue::Review,
+            "review-requested",
             nodes(data.review.nodes).filter_map(review).collect(),
+            data.review.page_info.has_next_page,
+            data.review.page_info.end_cursor,
         ),
     ];
+    // A queue longer than one page continues on its own.
+    for queue in &mut queues {
+        for _ in 1..MAX_PAGES {
+            if !queue.more {
+                break;
+            }
+            let data = client.graphql::<InboxMore>(inbox_more::Variables {
+                query: queue.query.clone(),
+                after: queue.cursor.take(),
+            })?;
+            queue
+                .prs
+                .extend(nodes(data.search.nodes).filter_map(more_pr));
+            queue.more = data.search.page_info.has_next_page;
+            queue.cursor = data.search.page_info.end_cursor;
+        }
+    }
+    let queues = queues.into_iter().map(|read| (read.queue, read.prs));
     let mut prs: Vec<PullRequest> = Vec::new();
     for (queue, found) in queues {
         let found: Vec<PullRequest> = found;
@@ -71,10 +125,20 @@ pub fn open(client: &Client) -> Result<Vec<PullRequest>> {
 /// PRs merged in the last [`MERGED_DAYS`] days that involve you, newest merge first.
 pub fn merged(client: &Client) -> Result<Vec<PullRequest>> {
     let since = crate::time::date_days_ago(MERGED_DAYS);
-    let data = client.graphql::<Merged>(merged::Variables {
-        query: format!("is:pr is:merged archived:false involves:@me merged:>={since}"),
-    })?;
-    let mut prs: Vec<PullRequest> = nodes(data.search.nodes).filter_map(merged_pr).collect();
+    let query = format!("is:pr is:merged archived:false involves:@me merged:>={since}");
+    let mut prs: Vec<PullRequest> = Vec::new();
+    let mut after = None;
+    for _ in 0..MAX_PAGES {
+        let data = client.graphql::<Merged>(merged::Variables {
+            query: query.clone(),
+            after: after.take(),
+        })?;
+        prs.extend(nodes(data.search.nodes).filter_map(merged_pr));
+        if !data.search.page_info.has_next_page {
+            break;
+        }
+        after = data.search.page_info.end_cursor;
+    }
     prs.sort_by(|a, b| b.merged_at.cmp(&a.merged_at));
     Ok(prs)
 }
@@ -185,3 +249,4 @@ convert!(authored, inbox, InboxAuthoredNodes);
 convert!(assigned, inbox, InboxAssignedNodes);
 convert!(review, inbox, InboxReviewNodes);
 convert!(merged_pr, merged, MergedSearchNodes);
+convert!(more_pr, inbox_more, InboxMoreSearchNodes);
