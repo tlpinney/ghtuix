@@ -357,7 +357,7 @@ pub fn preview_lines(pr: &PullRequest) -> Vec<Line<'static>> {
     if pr.body.trim().is_empty() {
         lines.push(Line::raw("No description"));
     }
-    lines.extend(pr.body.lines().map(|line| Line::raw(line.to_owned())));
+    lines.extend(crate::markdown::lines(&pr.body, ""));
     lines
 }
 

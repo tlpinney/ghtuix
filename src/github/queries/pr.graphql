@@ -6,7 +6,7 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
       number
       title
       url
-      bodyText
+      body
       state
       isDraft
       createdAt
@@ -31,7 +31,7 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
             __typename
             login
           }
-          bodyText
+          body
           createdAt
         }
       }
@@ -42,7 +42,7 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
             login
           }
           state
-          bodyText
+          body
           submittedAt
         }
       }
@@ -57,7 +57,7 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
                 __typename
                 login
               }
-              bodyText
+              body
               createdAt
             }
           }

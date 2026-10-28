@@ -9,6 +9,7 @@ publish = false
 anyhow = "1.0.104"
 crossterm = "0.29.0"
 graphql_client = "0.16.0"
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

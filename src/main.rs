@@ -9,6 +9,7 @@ mod github;
 mod inbox;
 mod keybar;
 mod local;
+mod markdown;
 mod model;
 mod pr;
 mod time;

@@ -145,21 +145,6 @@ impl PrView {
     }
 }
 
-/// A body's lines, trimmed at the end, with runs of blank lines shown as one.
-fn body_lines(body: &str) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for line in body.lines().map(str::trim_end) {
-        if line.is_empty() && lines.last().is_none_or(|last| last.is_empty()) {
-            continue;
-        }
-        lines.push(line.to_owned());
-    }
-    while lines.last().is_some_and(|last| last.is_empty()) {
-        lines.pop();
-    }
-    lines
-}
-
 fn bold(text: impl Into<String>) -> Line<'static> {
     Line::styled(text.into(), Style::default().add_modifier(Modifier::BOLD))
 }
@@ -207,7 +192,7 @@ fn summary(page: &PrPage) -> Vec<Line<'static>> {
     if page.body.trim().is_empty() {
         lines.push(Line::raw("No description"));
     }
-    lines.extend(body_lines(&page.body).into_iter().map(Line::raw));
+    lines.extend(crate::markdown::lines(&page.body, ""));
     lines
 }
 
@@ -220,9 +205,7 @@ fn entry(lines: &mut Vec<Line<'static>>, entry: &Entry, indent: &str) {
         ),
         Span::raw(format!(" · {what} · {} ago", time::age(&entry.at))),
     ]));
-    for line in body_lines(&entry.body) {
-        lines.push(Line::raw(format!("{indent}  {line}")));
-    }
+    lines.extend(crate::markdown::lines(&entry.body, &format!("{indent}  ")));
     lines.push(Line::raw(""));
 }
 
@@ -353,12 +336,6 @@ pub(crate) mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    #[test]
-    fn bodies_collapse_blank_runs_and_trailing_space() {
-        assert_eq!(body_lines("a  \n\n\n\nb\n\n"), ["a", "", "b"]);
-        assert!(body_lines("\n\n").is_empty());
     }
 
     #[test]

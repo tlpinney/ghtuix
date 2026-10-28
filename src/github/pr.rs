@@ -75,7 +75,7 @@ fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage 
         );
         conversation.push(Entry {
             author: who,
-            body: comment.body_text,
+            body: comment.body,
             at: comment.created_at,
             review: None,
         });
@@ -97,7 +97,7 @@ fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage 
         );
         conversation.push(Entry {
             author: who,
-            body: review.body_text,
+            body: review.body,
             at: review.submitted_at.unwrap_or_default(),
             review: Some(stance),
         });
@@ -118,7 +118,7 @@ fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage 
                             person(a.login, bot)
                         },
                     ),
-                    body: comment.body_text,
+                    body: comment.body,
                     at: comment.created_at,
                     review: None,
                 })
@@ -151,7 +151,7 @@ fn convert(repo: &str, pr: PrPageRepositoryPullRequest) -> crate::model::PrPage 
         number: pr.number,
         title: pr.title,
         url: pr.url,
-        body: pr.body_text,
+        body: pr.body,
         state: format!("{:?}", pr.state).to_lowercase(),
         draft: pr.is_draft,
         author,
