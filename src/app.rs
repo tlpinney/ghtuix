@@ -96,6 +96,8 @@ pub enum Action {
     SearchEdit,
     /// Run the typed search.
     RunSearch,
+    /// Stop typing into the search query.
+    SearchDone,
     /// Show unread notifications only (`false`) or all of them.
     NotificationsAll(bool),
     /// Mark the selected notification read, or done.
@@ -147,7 +149,8 @@ pub enum Message {
         result: Result<(Vec<RunJob>, Option<Saved>), String>,
     },
     History(Result<Vec<GraphLine>, String>),
-    Changes(Result<Changes, String>),
+    /// The checkout's changes, from read number `generation`.
+    Changes(u64, Result<Changes, String>),
     /// `git show` of one commit.
     Commit {
         sha: String,
@@ -155,10 +158,12 @@ pub enum Message {
     },
     /// A PR's commits or timeline, read when its tab first showed.
     PrCommits {
+        repo: String,
         number: i64,
         result: Result<Vec<PrCommit>, String>,
     },
     PrTimeline {
+        repo: String,
         number: i64,
         result: Result<Vec<Event>, String>,
     },
@@ -274,7 +279,7 @@ pub enum Job {
     LoadRefs(Repo),
     ShowStash(Repo, String),
     PlanRebase(Repo, String),
-    LoadChanges(Repo),
+    LoadChanges(Repo, u64),
     ShowCommit(Repo, String),
     Write {
         kind: WriteKind,
@@ -462,6 +467,7 @@ impl App {
             }
             Action::SearchEdit => self.search.editing = true,
             Action::RunSearch => self.run_search(),
+            Action::SearchDone => self.search.editing = false,
             Action::Select(index) if self.view == View::Search => {
                 self.search.editing = false;
                 if index == self.search.selected {
@@ -555,6 +561,7 @@ impl App {
                 self.local.commit = None;
                 self.local.scroll = 0;
                 self.local.line = None;
+                self.local.file = 0;
             }
             Action::Select(index)
                 if self.view == View::Local
@@ -645,6 +652,10 @@ impl App {
             }
             Action::StageLine => {}
             Action::Stage | Action::Unstage => {
+                if self.local.writing {
+                    self.status = "Wait for the last change to finish".into();
+                    return;
+                }
                 if let (Ok(repo), Some((path, _))) = (&self.local.repo, self.local.selected_file())
                 {
                     let op = if action == Action::Stage {
@@ -653,6 +664,7 @@ impl App {
                         GitOp::Unstage(path.clone())
                     };
                     self.jobs.push(Job::GitWrite(repo.clone(), op));
+                    self.local.writing = true;
                 }
             }
             Action::StartCommit => match &self.local.changes {
@@ -956,6 +968,15 @@ impl App {
                 Some(compose) => compose.stage = Stage::Editing,
                 None => {}
             },
+            // A write on its way cannot be called back: its answer closes the box.
+            Action::ComposeCancel
+                if self
+                    .compose
+                    .as_ref()
+                    .is_some_and(|c| c.stage == Stage::Sending) =>
+            {
+                self.status = "Sending… wait for the answer".into();
+            }
             Action::ComposeCancel => self.compose = None,
             Action::ComposeConfirm => {
                 if let Some(compose) = &mut self.compose
@@ -1136,9 +1157,11 @@ impl App {
                         name: item.label.clone(),
                     })
                     .collect();
+                // Only a label the picker listed and the user unchecked is removed.
                 let remove: Vec<crate::model::Label> = page
                     .labels
                     .iter()
+                    .filter(|label| picker.offers(&label.id))
                     .filter(|label| !checked.iter().any(|item| item.id == label.id))
                     .cloned()
                     .collect();
@@ -1163,9 +1186,11 @@ impl App {
                     .filter(|login| !page.requested.contains(login))
                     .cloned()
                     .collect();
+                // Bots and anyone the list left out stay requested.
                 let remove: Vec<String> = page
                     .requested
                     .iter()
+                    .filter(|login| picker.offers(login))
                     .filter(|login| !checked.contains(login))
                     .cloned()
                     .collect();
@@ -1391,7 +1416,9 @@ impl App {
         {
             self.local.loading = true;
             self.jobs.push(Job::LoadHistory(repo.clone()));
-            self.jobs.push(Job::LoadChanges(repo.clone()));
+            self.local.generation += 1;
+            self.jobs
+                .push(Job::LoadChanges(repo.clone(), self.local.generation));
             self.jobs.push(Job::LoadRefs(repo.clone()));
         }
     }
@@ -1522,9 +1549,12 @@ impl App {
                 Ok(plan) => self.compose_local(LocalOp::Rebase { onto, plan }),
                 Err(error) => self.status = error,
             },
-            Message::Changes(result) => {
-                self.local.changes = Some(result);
-                self.local.settle_line();
+            Message::Changes(generation, result) => {
+                if generation == self.local.generation {
+                    self.local.take_changes(result);
+                    // What a write changed is on screen now: the next one may build on it.
+                    self.local.writing = false;
+                }
             }
             Message::Commit { sha, result } => {
                 if let Some((open, shown)) = &mut self.local.commit
@@ -1533,15 +1563,25 @@ impl App {
                     *shown = Some(result.unwrap_or_else(|error| error));
                 }
             }
-            Message::PrCommits { number, result } => {
+            Message::PrCommits {
+                repo,
+                number,
+                result,
+            } => {
                 if let Some(pr) = &mut self.pr
+                    && pr.summary.repo == repo
                     && pr.summary.number == number
                 {
                     pr.commits = Some(result);
                 }
             }
-            Message::PrTimeline { number, result } => {
+            Message::PrTimeline {
+                repo,
+                number,
+                result,
+            } => {
                 if let Some(pr) = &mut self.pr
+                    && pr.summary.repo == repo
                     && pr.summary.number == number
                 {
                     pr.timeline = Some(result);
@@ -1599,8 +1639,8 @@ impl App {
                     (Err(error), false) => self.status = error.clone(),
                     (Ok(_), false) => {}
                 }
-                // Status, diffs and (after a commit) history all changed.
-                self.local.writing = false;
+                // Status, diffs and (after a commit) history all changed. `writing` stays
+                // set until the fresh changes arrive.
                 self.local.loading = false;
                 self.load_local();
             }
@@ -1729,7 +1769,7 @@ impl App {
                 .contains(crossterm::event::KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Enter => self.dispatch(Action::RunSearch),
-                KeyCode::Esc | KeyCode::Down => self.search.editing = false,
+                KeyCode::Esc | KeyCode::Down => self.dispatch(Action::SearchDone),
                 KeyCode::Backspace => {
                     self.search.query.pop();
                 }
@@ -1965,8 +2005,10 @@ impl App {
                 Action::DashboardDays(days),
             ));
         } else if self.view == View::Search && self.search.editing {
-            // Keys type into the query; Esc leaves it. Clicks still reach every control.
+            // Every other key types into the query, so the bar shows only these two.
             controls.push(Control::new(KeyCode::Enter, "Search", Action::RunSearch));
+            controls.push(Control::new(KeyCode::Esc, "Done", Action::SearchDone));
+            return controls;
         } else if self.view == View::Search {
             controls.push(Control::new(KeyCode::Enter, "Open", Action::Open));
             controls.push(Control::new(
@@ -2676,17 +2718,20 @@ mod tests {
             press(&mut app, KeyCode::Char('2'));
             press(&mut app, KeyCode::Char('w'));
             app.jobs.clear();
-            app.receive(Message::Changes(Ok(Changes {
-                status: Status {
-                    branch: "main".into(),
-                    staged: vec![("done.rs".into(), 'M')],
-                    unstaged: vec![("a.rs".into(), 'M'), ("b.rs".into(), '?')],
-                    ..Status::default()
-                },
-                working: "diff --git a/a.rs b/a.rs\n+edit".into(),
-                staged: String::new(),
-                author: "Ada <ada@example.invalid>".into(),
-            })));
+            app.receive(Message::Changes(
+                app.local.generation,
+                Ok(Changes {
+                    status: Status {
+                        branch: "main".into(),
+                        staged: vec![("done.rs".into(), 'M')],
+                        unstaged: vec![("a.rs".into(), 'M'), ("b.rs".into(), '?')],
+                        ..Status::default()
+                    },
+                    working: "diff --git a/a.rs b/a.rs\n+edit".into(),
+                    staged: String::new(),
+                    author: "Ada <ada@example.invalid>".into(),
+                }),
+            ));
             let screen = draw(&mut app, 120).join("\n");
             assert!(
                 screen.contains("+edit") && screen.contains("+ Stage"),
@@ -2756,6 +2801,7 @@ mod tests {
             );
             app.jobs.clear();
             app.receive(Message::PrCommits {
+                repo: "o/a".into(),
                 number: 1,
                 result: Ok(vec![PrCommit {
                     oid: "c".repeat(40),
@@ -2769,6 +2815,7 @@ mod tests {
             assert!(screen.contains("✓ cccccccc First change"), "{screen}");
             press(&mut app, KeyCode::Char('t'));
             app.receive(Message::PrTimeline {
+                repo: "o/a".into(),
                 number: 1,
                 result: Ok(vec![Event {
                     at: "2026-10-27T10:00:00Z".into(),
@@ -3413,17 +3460,20 @@ mod tests {
         } else {
             (Vec::new(), files, HUNKS.to_string(), String::new())
         };
-        app.receive(Message::Changes(Ok(Changes {
-            status: Status {
-                branch: "main".into(),
-                staged,
-                unstaged,
-                ..Status::default()
-            },
-            working,
-            staged: staged_diff,
-            author: "Ada <ada@example.invalid>".into(),
-        })));
+        app.receive(Message::Changes(
+            app.local.generation,
+            Ok(Changes {
+                status: Status {
+                    branch: "main".into(),
+                    staged,
+                    unstaged,
+                    ..Status::default()
+                },
+                working,
+                staged: staged_diff,
+                author: "Ada <ada@example.invalid>".into(),
+            }),
+        ));
         app
     }
 
@@ -3475,6 +3525,15 @@ mod tests {
                 composed: false,
                 result: Ok(String::new()),
             });
+            assert!(
+                app.local.writing,
+                "it waits for the fresh changes, not just git"
+            );
+            let fresh = app.local.changes.clone().unwrap();
+            // An answer to the read from before the write is ignored.
+            app.receive(Message::Changes(app.local.generation - 1, fresh.clone()));
+            assert!(app.local.writing);
+            app.receive(Message::Changes(app.local.generation, fresh));
             assert!(!app.local.writing);
         }
     }
@@ -3780,5 +3839,129 @@ mod tests {
         assert!(app.status.contains(r#"theme = "nord""#), "{}", app.status);
         crate::theme::set(start);
         assert!(!crate::theme::set("no-such-theme"));
+    }
+
+    #[test]
+    fn a_write_on_its_way_cannot_be_cancelled_so_its_answer_closes_its_own_box() {
+        let mut app = open_pr(PrTab::Summary);
+        press(&mut app, KeyCode::Char('n'));
+        type_text(&mut app, "first");
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Enter);
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(app.status, "Sending… wait for the answer");
+        assert_eq!(app.compose.as_ref().unwrap().stage, Stage::Sending);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            app.compose.as_ref().unwrap().editor.text(),
+            "first",
+            "no second box"
+        );
+        app.receive(Message::Written(Ok(
+            "https://github.com/o/a/pull/1#c".into()
+        )));
+        assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn the_selected_file_is_kept_by_path_when_the_list_changes() {
+        let mut app = local_with_hunks(LocalTab::Working);
+        let mut changes = app.local.changes.clone().unwrap().unwrap();
+        changes.status.unstaged = vec![("a.rs".into(), 'M'), ("b.rs".into(), 'M')];
+        changes.working = format!("{HUNKS}{}", HUNKS.replace("a.rs", "b.rs"));
+        app.receive(Message::Changes(app.local.generation, Ok(changes.clone())));
+        app.local.select_file(1);
+        press(&mut app, KeyCode::Enter);
+        // a.rs is staged elsewhere: b.rs moves up and stays selected, cursor and all.
+        changes.status.unstaged = vec![("b.rs".into(), 'M')];
+        changes.working = HUNKS.replace("a.rs", "b.rs");
+        app.receive(Message::Changes(app.local.generation, Ok(changes.clone())));
+        assert_eq!(app.local.selected_file().unwrap().0, "b.rs");
+        assert!(app.local.line.is_some());
+        // b.rs leaves too: nothing else inherits its cursor.
+        changes.status.unstaged = vec![("c.rs".into(), 'M')];
+        app.receive(Message::Changes(app.local.generation, Ok(changes)));
+        assert_eq!(app.local.file, 0);
+        assert_eq!(app.local.line, None);
+    }
+
+    #[test]
+    fn late_answers_for_another_pr_are_ignored() {
+        let mut app = open_pr(PrTab::Commits);
+        app.receive(Message::PrCommits {
+            repo: "o/other".into(),
+            number: 1,
+            result: Ok(Vec::new()),
+        });
+        assert!(
+            app.pr.as_ref().unwrap().commits.is_none(),
+            "same number, other repo"
+        );
+        app.receive(Message::Pr {
+            repo: "o/a".into(),
+            number: 99,
+            result: Err("gone".into()),
+        });
+        assert_eq!(app.pr.as_ref().unwrap().error, None);
+    }
+
+    #[test]
+    fn a_new_head_while_the_diff_loads_asks_again() {
+        let mut app = open_pr(PrTab::Summary);
+        app.pr.as_mut().unwrap().diff = None;
+        app.jobs.clear();
+        press(&mut app, KeyCode::Char('f'));
+        assert!(matches!(&app.jobs[..], [Job::LoadDiff { .. }]));
+        app.jobs.clear();
+        let mut moved = crate::pr::tests::page();
+        moved.head_oid = "c".repeat(40);
+        app.receive(pr_page(moved));
+        assert!(
+            matches!(&app.jobs[..], [Job::LoadDiff { head, .. }] if *head == "c".repeat(40)),
+            "{:?}",
+            app.jobs
+        );
+    }
+
+    #[test]
+    fn changing_reviewers_leaves_bots_and_unlisted_people_requested() {
+        let mut app = open_pr(PrTab::Summary);
+        app.pr.as_mut().unwrap().page.as_mut().unwrap().requested =
+            vec!["bob".into(), "Copilot".into()];
+        press(&mut app, KeyCode::Char('p'));
+        type_text(&mut app, "review");
+        press(&mut app, KeyCode::Enter);
+        app.receive(Message::Choices {
+            purpose: Purpose::Reviewers,
+            result: Ok(vec![Item::new("alice", "alice"), Item::new("bob", "bob")]),
+        });
+        type_text(&mut app, "ali");
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        app.jobs.clear();
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(
+                &app.jobs[..],
+                [Job::Write { kind: WriteKind::Reviewers { add, remove, .. }, .. }]
+                    if add == &["alice"] && remove.is_empty()
+            ),
+            "{:?}",
+            app.jobs
+        );
+    }
+
+    #[test]
+    fn while_typing_a_search_the_bar_shows_only_what_works() {
+        let mut app = signed_in();
+        press(&mut app, KeyCode::Char('5'));
+        let bar = draw(&mut app, 140)[19].clone();
+        assert!(
+            bar.contains("Enter Search") && bar.contains("Esc Done"),
+            "{bar}"
+        );
+        assert!(!bar.contains("Refresh") && !bar.contains("Quit"), "{bar}");
+        click(&mut app, &Action::SearchDone);
+        assert!(!app.search.editing);
     }
 }

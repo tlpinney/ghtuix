@@ -28,8 +28,10 @@ search, notifications, dashboard.
 
 ## Architecture
 
-- **One GitHub client** (`github/`). The token comes from `GH_TOKEN`/`GITHUB_TOKEN`, else
-  once from `gh auth token --hostname <host>`; it stays in memory and is sent only to that
+- **One GitHub client** (`github/`). The token comes from the environment variables meant
+  for the host, as `gh` reads them (`GH_TOKEN`/`GITHUB_TOKEN` for github.com and
+  `*.ghe.com`, `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` for an Enterprise Server),
+  else once from `gh auth token --hostname <host>`; it stays in memory and is sent only to that
   host's API. Requests go over one pooled HTTPS agent (`ureq` + rustls); independent
   requests run in parallel on threads. One place maps HTTP and GraphQL errors.
 - **Conforms to GitHub's spec.** GraphQL is the main API: each query lives in

@@ -62,8 +62,11 @@ pub struct Local {
     /// The cursor in the selected file's diff (an index into its lines, always on an
     /// added or removed line), while hunks and lines are being staged.
     pub line: Option<usize>,
-    /// A local write is running; another waits so it never applies to stale text.
+    /// A local write is running, or ran and its fresh changes have not arrived yet;
+    /// another write waits, so it never builds on stale text.
     pub writing: bool,
+    /// Counts reads of the changes; an answer to an older read is ignored.
+    pub generation: u64,
     pub refs: Option<Result<Refs, String>>,
     /// The selected row of the Branches or Stash list.
     pub branch: usize,
@@ -84,6 +87,7 @@ impl Local {
             file: 0,
             line: None,
             writing: false,
+            generation: 0,
             refs: None,
             branch: 0,
             stash: 0,
@@ -193,6 +197,23 @@ impl Local {
     pub fn place_line(&mut self, index: usize) {
         if self.change_lines().contains(&index) {
             self.line = Some(index);
+        }
+    }
+
+    /// Takes newly read changes, keeping the selected file (by path) and its cursor.
+    pub fn take_changes(&mut self, changes: Result<Changes, String>) {
+        let path = self.selected_file().map(|(path, _)| path.clone());
+        self.changes = Some(changes);
+        match path.and_then(|path| self.files().iter().position(|(p, _)| *p == path)) {
+            Some(index) => {
+                self.file = index;
+                self.settle_line();
+            }
+            // The file left this list (staged whole, say): its cursor goes too.
+            None => {
+                self.file = self.file.min(self.files().len().saturating_sub(1));
+                self.line = None;
+            }
         }
     }
 
@@ -362,9 +383,16 @@ impl Local {
         };
         let mut lines = Vec::new();
         if refs.operation.is_some() {
+            let banner = if self.tab == LocalTab::Stash {
+                "A rebase stopped: B Branches has Continue and Abort."
+            } else {
+                "A rebase stopped. Fix the conflicts and stage them (w Working), then C Continue or X Abort."
+            };
             lines.push(Line::styled(
-                "A rebase stopped. Fix the conflicts and stage them (w Working), then C Continue or X Abort.",
-                Style::default().fg(crate::theme::p().yellow).add_modifier(Modifier::BOLD),
+                banner,
+                Style::default()
+                    .fg(crate::theme::p().yellow)
+                    .add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::raw(""));
         }

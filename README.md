@@ -7,7 +7,9 @@ for the design.
 ## Install
 
 Requires Rust 1.85+ (edition 2024), `git`, and the [GitHub CLI](https://cli.github.com)
-signed in (`gh auth login`). ghtuix only asks `gh` for your token.
+signed in (`gh auth login`). ghtuix only asks `gh` for your token (or reads `GH_TOKEN`
+for github.com, `GH_ENTERPRISE_TOKEN` for an Enterprise Server), keeps it in memory and
+sends it only to that host. The cache (`~/.cache/ghtuix`) is readable only by you.
 
 ```sh
 cargo install --path .

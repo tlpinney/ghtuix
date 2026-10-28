@@ -114,6 +114,11 @@ impl Picker {
         }
     }
 
+    /// Whether `id` is one of the items offered (an unlisted one is never changed).
+    pub fn offers(&self, id: &str) -> bool {
+        matches!(&self.items, Some(Ok(items)) if items.iter().any(|item| item.id == id))
+    }
+
     pub fn checked(&self) -> Vec<&Item> {
         match &self.items {
             Some(Ok(items)) => items.iter().filter(|item| item.checked).collect(),

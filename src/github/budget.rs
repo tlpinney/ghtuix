@@ -1,8 +1,10 @@
 //! GitHub's rate limits, as every response reports them, and the client's request gate.
 //!
-//! Each response carries `x-ratelimit-remaining`/`-limit`/`-reset`. A 403 or 429 with
-//! `retry-after` (a secondary limit) or with nothing remaining blocks every request until
-//! GitHub says to resume. At most [`MAX_IN_FLIGHT`] requests run at once; the rest wait.
+//! Each response carries `x-ratelimit-remaining`/`-limit`/`-reset` for its resource
+//! (`x-ratelimit-resource`): GraphQL and REST have separate budgets. A 403 or 429 with
+//! nothing remaining blocks that resource until its reset; one with `retry-after` (a
+//! secondary limit) blocks every request until GitHub says to resume. At most
+//! [`MAX_IN_FLIGHT`] requests run at once; the rest wait.
 
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -97,10 +99,34 @@ fn wait(seconds: i64) -> String {
     }
 }
 
-/// Shared by every clone of a client: the budget and the in-flight count.
+/// Which of GitHub's budgets a request spends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resource {
+    Graphql,
+    Rest,
+}
+
+/// The GraphQL and REST budgets, and the in-flight count.
+#[derive(Debug, Default)]
+struct State {
+    graphql: Budget,
+    rest: Budget,
+    in_flight: usize,
+}
+
+impl State {
+    fn budget(&mut self, resource: Resource) -> &mut Budget {
+        match resource {
+            Resource::Graphql => &mut self.graphql,
+            Resource::Rest => &mut self.rest,
+        }
+    }
+}
+
+/// Shared by every clone of a client: the budgets and the in-flight count.
 #[derive(Debug, Default)]
 pub struct Gate {
-    state: Mutex<(Budget, usize)>,
+    state: Mutex<State>,
     freed: Condvar,
     /// When the last write finished; held for the whole of each write.
     last_write: Mutex<Option<std::time::Instant>>,
@@ -111,18 +137,18 @@ pub const WRITE_SPACING: Duration = Duration::from_secs(1);
 
 impl Gate {
     /// Waits for a free slot; refuses at once while GitHub has asked to wait.
-    pub fn enter(&self, now: i64) -> Result<Slot<'_>, String> {
+    pub fn enter(&self, resource: Resource, now: i64) -> Result<Slot<'_>, String> {
         let mut state = self.state.lock().unwrap();
-        if let Some(until) = state.0.blocked(now) {
+        if let Some(until) = state.budget(resource).blocked(now) {
             return Err(format!(
                 "GitHub rate limit reached • not sent; requests resume in {}",
                 wait(until - now)
             ));
         }
-        while state.1 >= MAX_IN_FLIGHT {
+        while state.in_flight >= MAX_IN_FLIGHT {
             state = self.freed.wait(state).unwrap();
         }
-        state.1 += 1;
+        state.in_flight += 1;
         Ok(Slot { gate: self })
     }
 
@@ -136,12 +162,51 @@ impl Gate {
         WriteTurn { last }
     }
 
-    pub fn budget(&self) -> Budget {
-        self.state.lock().unwrap().0
+    /// The budget that needs attention first: a blocked one, else the one with the
+    /// smaller share left. Automatic refresh and the status note follow it.
+    pub fn budget(&self, now: i64) -> Budget {
+        let state = self.state.lock().unwrap();
+        let (a, b) = (state.graphql, state.rest);
+        match (a.blocked(now), b.blocked(now)) {
+            (Some(x), Some(y)) => {
+                if x >= y {
+                    a
+                } else {
+                    b
+                }
+            }
+            (Some(_), None) => a,
+            (None, Some(_)) => b,
+            (None, None) if b.fraction_left() < a.fraction_left() => b,
+            (None, None) => a,
+        }
     }
 
-    pub fn observe(&self, status: u16, header: impl Fn(&str) -> Option<String>, now: i64) {
-        self.state.lock().unwrap().0.observe(status, header, now);
+    /// Records a response of a request made for `resource` (GitHub's own
+    /// `x-ratelimit-resource` header decides when present).
+    pub fn observe(
+        &self,
+        resource: Resource,
+        status: u16,
+        header: impl Fn(&str) -> Option<String>,
+        now: i64,
+    ) {
+        let resource = match header("x-ratelimit-resource").as_deref() {
+            Some("graphql") => Resource::Graphql,
+            Some(_) => Resource::Rest,
+            None => resource,
+        };
+        let mut state = self.state.lock().unwrap();
+        state.budget(resource).observe(status, &header, now);
+        // A secondary limit (`retry-after`) holds every request, not just this kind.
+        let paused = state.budget(resource).blocked_until;
+        if matches!(status, 403 | 429) && header("retry-after").is_some() {
+            let other = match resource {
+                Resource::Graphql => Resource::Rest,
+                Resource::Rest => Resource::Graphql,
+            };
+            state.budget(other).blocked_until = paused;
+        }
     }
 }
 
@@ -164,7 +229,7 @@ pub struct Slot<'a> {
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        self.gate.state.lock().unwrap().1 -= 1;
+        self.gate.state.lock().unwrap().in_flight -= 1;
         self.gate.freed.notify_one();
     }
 }
@@ -224,9 +289,13 @@ mod tests {
     #[test]
     fn retry_after_blocks_the_gate_until_it_passes() {
         let gate = Gate::default();
-        gate.observe(429, headers(&[("retry-after", "30")]), 100);
-        assert!(gate.enter(110).unwrap_err().contains("resume in 20s"));
-        assert!(gate.enter(131).is_ok());
+        gate.observe(Resource::Rest, 429, headers(&[("retry-after", "30")]), 100);
+        assert!(
+            gate.enter(Resource::Graphql, 110)
+                .unwrap_err()
+                .contains("resume in 20s")
+        );
+        assert!(gate.enter(Resource::Graphql, 131).is_ok());
     }
 
     #[test]
@@ -241,14 +310,49 @@ mod tests {
     #[test]
     fn the_gate_holds_at_most_max_in_flight() {
         let gate = std::sync::Arc::new(Gate::default());
-        let slots: Vec<_> = (0..MAX_IN_FLIGHT).map(|_| gate.enter(0).unwrap()).collect();
+        let slots: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| gate.enter(Resource::Graphql, 0).unwrap())
+            .collect();
         let waiter = {
             let gate = gate.clone();
-            std::thread::spawn(move || gate.enter(0).map(|_| ()).is_ok())
+            std::thread::spawn(move || gate.enter(Resource::Graphql, 0).map(|_| ()).is_ok())
         };
         std::thread::sleep(Duration::from_millis(50));
         assert!(!waiter.is_finished(), "the fifth request waits");
         drop(slots);
         assert!(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn graphql_and_rest_keep_their_own_budgets() {
+        let gate = Gate::default();
+        let low = [
+            ("x-ratelimit-resource", "graphql"),
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "100"),
+            ("x-ratelimit-reset", "500"),
+        ];
+        let healthy = [
+            ("x-ratelimit-resource", "core"),
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "4900"),
+        ];
+        gate.observe(Resource::Graphql, 200, headers(&low), 0);
+        gate.observe(Resource::Rest, 200, headers(&healthy), 0);
+        assert_eq!(
+            gate.budget(0).remaining,
+            100,
+            "a healthy REST read hides nothing"
+        );
+        // REST running out blocks REST, not GraphQL.
+        let empty = [
+            ("x-ratelimit-resource", "core"),
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "900"),
+        ];
+        gate.observe(Resource::Rest, 403, headers(&empty), 10);
+        assert!(gate.enter(Resource::Rest, 20).is_err());
+        assert!(gate.enter(Resource::Graphql, 20).is_ok());
     }
 }

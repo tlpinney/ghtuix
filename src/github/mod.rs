@@ -65,7 +65,7 @@ impl Client {
 
     /// The rate-limit budget GitHub last reported.
     pub fn budget(&self) -> budget::Budget {
-        self.gate.budget()
+        self.gate.budget(crate::time::now())
     }
 
     /// Runs one GraphQL query or mutation and returns its typed data.
@@ -73,7 +73,7 @@ impl Client {
         let body: QueryBody<Q::Variables> = Q::build_query(variables);
         let _slot = self
             .gate
-            .enter(crate::time::now())
+            .enter(budget::Resource::Graphql, crate::time::now())
             .map_err(|refused| anyhow!(refused))?;
         let mut response = self
             .agent
@@ -84,6 +84,7 @@ impl Client {
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         self.gate.observe(
+            budget::Resource::Graphql,
             status,
             |name| Some(headers.get(name)?.to_str().ok()?.to_owned()),
             crate::time::now(),
@@ -166,7 +167,7 @@ impl Client {
         let url = format!("{}/{path}", self.rest_url);
         let _slot = self
             .gate
-            .enter(crate::time::now())
+            .enter(budget::Resource::Rest, crate::time::now())
             .map_err(|refused| anyhow!(refused))?;
         let auth = format!("Bearer {}", self.token);
         let response = if let Some(body) = body {
@@ -210,7 +211,8 @@ impl Client {
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let header = |name: &str| Some(headers.get(name)?.to_str().ok()?.to_owned());
-        self.gate.observe(status, header, crate::time::now());
+        self.gate
+            .observe(budget::Resource::Rest, status, header, crate::time::now());
         if status == 304 {
             return Ok(Reply {
                 body: None,

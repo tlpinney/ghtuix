@@ -353,9 +353,10 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 Message::Merged(client().and_then(|c| github::inbox::merged(&c).map_err(text)))
             }
             Job::LoadPrCommits { repo, number } => Message::PrCommits {
-                number,
                 result: client()
                     .and_then(|c| github::history::commits(&c, &repo, number).map_err(text)),
+                repo,
+                number,
             },
             Job::LoadNotifications { all, saved } => Message::Notifications {
                 all,
@@ -398,9 +399,10 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 }),
             },
             Job::LoadPrTimeline { repo, number } => Message::PrTimeline {
-                number,
                 result: client()
                     .and_then(|c| github::history::timeline(&c, &repo, number).map_err(text)),
+                repo,
+                number,
             },
             Job::LoadLog {
                 repo,
@@ -454,7 +456,8 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 result: repo.rebase_plan(&onto).map_err(text),
                 onto,
             },
-            Job::LoadChanges(repo) => Message::Changes(
+            Job::LoadChanges(repo, generation) => Message::Changes(
+                generation,
                 repo.status()
                     .and_then(|status| {
                         Ok(local::Changes {
