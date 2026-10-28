@@ -107,6 +107,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
         }
         let jobs: Vec<Job> = app.jobs.drain(..).collect();
         for job in jobs {
+            // Only web pages open, never a file, another scheme or an opener option.
+            if let Job::Open(url) = &job
+                && !openable(url)
+            {
+                app.status = format!("Not opening {url}: only https:// links open");
+                continue;
+            }
             let job = match &cache {
                 Some(cache) => with_saved(cache, &host, job),
                 None => job,
@@ -114,7 +121,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
             // The cache answers what has not changed; only the rest goes to GitHub.
             match cache
                 .as_ref()
-                .and_then(|cache| from_cache(cache, &host, &job))
+                .and_then(|cache| from_cache(cache, &host, &job, app.login.as_deref()))
             {
                 Some(message) => app.receive(message),
                 None => spawn(job, host.clone(), session.clone(), tx.clone()),
@@ -139,10 +146,26 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
     Ok(())
 }
 
+/// A link the browser may be handed: plain `https://`, nothing an opener could misread.
+fn openable(url: &str) -> bool {
+    url.strip_prefix("https://").is_some_and(|rest| {
+        !rest.is_empty() && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+    })
+}
+
 /// The cached answer to `job`, when the cache holds one that is still current: a PR page
 /// with the same `updatedAt` as the Inbox row, or the diff between the same two commits.
-fn from_cache(cache: &cache::Cache, host: &str, job: &Job) -> Option<Message> {
+/// Only once sign-in has confirmed the account the cache belongs to.
+fn from_cache(
+    cache: &cache::Cache,
+    host: &str,
+    job: &Job,
+    signed_in: Option<&str>,
+) -> Option<Message> {
     let (login, _) = cache.get::<String>(&cache::login_key(host))?;
+    if signed_in != Some(login.as_str()) {
+        return None;
+    }
     match job {
         Job::LoadPr {
             repo,
@@ -151,7 +174,11 @@ fn from_cache(cache: &cache::Cache, host: &str, job: &Job) -> Option<Message> {
         } => {
             let key = cache::pr_key(host, &login, repo, *number);
             let (page, _) = cache.get::<model::PrPage>(&key)?;
-            (page.updated_at == *updated_at).then(|| Message::Pr(Ok(Box::new(page))))
+            (page.updated_at == *updated_at).then(|| Message::Pr {
+                repo: repo.clone(),
+                number: *number,
+                result: Ok(Box::new(page)),
+            })
         }
         Job::LoadLog {
             repo,
@@ -166,9 +193,13 @@ fn from_cache(cache: &cache::Cache, host: &str, job: &Job) -> Option<Message> {
                 result: Ok(log),
             })
         }
-        Job::LoadDiff { base, head, .. } => {
-            let (diff, _) = cache.get::<String>(&cache::diff_key(host, &login, base, head))?;
+        Job::LoadDiff {
+            repo, base, head, ..
+        } => {
+            let key = cache::diff_key(host, &login, repo, base, head);
+            let (diff, _) = cache.get::<String>(&key)?;
             Some(Message::Diff {
+                repo: repo.clone(),
                 base: base.clone(),
                 head: head.clone(),
                 result: Ok(diff),
@@ -222,6 +253,12 @@ fn with_saved(cache: &cache::Cache, host: &str, job: Job) -> Job {
 /// Keeps what a message brings for later. Cache errors are not worth an error.
 fn save(cache: &cache::Cache, host: &str, message: &Message) {
     if let Message::SignedIn(Ok(login)) = message {
+        // Another account signed in: what was kept for the last one goes.
+        if let Some((old, _)) = cache.get::<String>(&cache::login_key(host))
+            && old != *login
+        {
+            let _ = cache.forget(host, &old);
+        }
         let _ = cache.put(&cache::login_key(host), login);
         return;
     }
@@ -230,14 +267,15 @@ fn save(cache: &cache::Cache, host: &str, message: &Message) {
     };
     let _ = match message {
         Message::Inbox(Ok(prs)) => cache.put(&cache::inbox_key(host, &login), prs),
-        Message::Pr(Ok(page)) => {
-            cache.put(&cache::pr_key(host, &login, &page.repo, page.number), page)
-        }
+        Message::Pr {
+            result: Ok(page), ..
+        } => cache.put(&cache::pr_key(host, &login, &page.repo, page.number), page),
         Message::Diff {
+            repo,
             base,
             head,
             result: Ok(diff),
-        } => cache.put(&cache::diff_key(host, &login, base, head), diff),
+        } => cache.put(&cache::diff_key(host, &login, repo, base, head), diff),
         Message::Runs {
             repo,
             result: Ok((_, Some(saved))),
@@ -295,20 +333,21 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
             Job::LoadInbox => {
                 Message::Inbox(client().and_then(|c| github::inbox::open(&c).map_err(text)))
             }
-            Job::LoadPr { repo, number, .. } => Message::Pr(client().and_then(|c| {
-                github::pr::page(&c, &repo, number)
-                    .map(Box::new)
-                    .map_err(text)
-            })),
-            Job::LoadDiff {
+            Job::LoadPr { repo, number, .. } => Message::Pr {
+                result: client().and_then(|c| {
+                    github::pr::page(&c, &repo, number)
+                        .map(Box::new)
+                        .map_err(text)
+                }),
                 repo,
                 number,
+            },
+            Job::LoadDiff { repo, base, head } => Message::Diff {
+                result: client()
+                    .and_then(|c| github::pr::diff(&c, &repo, &base, &head).map_err(text)),
+                repo,
                 base,
                 head,
-            } => Message::Diff {
-                base,
-                head,
-                result: client().and_then(|c| github::pr::diff(&c, &repo, number).map_err(text)),
             },
             Job::LoadMerged => {
                 Message::Merged(client().and_then(|c| github::inbox::merged(&c).map_err(text)))
@@ -440,6 +479,9 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 github::write::publish(&c, &kind, &pr_id, &head_oid, &body).map_err(text)
             })),
             Job::Open(url) => {
+                if !openable(&url) {
+                    return;
+                }
                 let opener = if cfg!(target_os = "macos") {
                     "open"
                 } else {
@@ -451,4 +493,24 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
         };
         let _ = tx.send(message);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_https_links_open() {
+        assert!(openable("https://github.com/o/a/pull/1"));
+        for url in [
+            "http://x",
+            "file:///etc/passwd",
+            "-a Calculator",
+            "smb://x/y",
+            "https://",
+            "https://a b",
+        ] {
+            assert!(!openable(url), "{url}");
+        }
+    }
 }

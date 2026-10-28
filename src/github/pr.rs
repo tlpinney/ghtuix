@@ -228,10 +228,15 @@ pub fn job_log(client: &Client, repo: &str, job_id: i64) -> Result<String> {
     )
 }
 
-/// The unified diff from `base` to `head` (commit SHAs, so it never changes).
-pub fn diff(client: &Client, repo: &str, number: i64) -> Result<String> {
+/// The unified diff of `head` against its merge base with `base` (commit SHAs, as the PR
+/// page read them), so it matches the page shown and never changes.
+pub fn diff(client: &Client, repo: &str, base: &str, head: &str) -> Result<String> {
+    let sha = |oid: &str| oid.len() >= 7 && oid.chars().all(|c| c.is_ascii_hexdigit());
+    if !sha(base) || !sha(head) {
+        anyhow::bail!("Not commit ids: {base} and {head}");
+    }
     client.rest_text(
-        &format!("repos/{repo}/pulls/{number}"),
+        &format!("repos/{repo}/compare/{base}...{head}"),
         "application/vnd.github.diff",
     )
 }

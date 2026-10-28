@@ -129,7 +129,12 @@ pub enum Message {
     SignedIn(Result<String, String>),
     Inbox(Result<Vec<PullRequest>, String>),
     Merged(Result<Vec<PullRequest>, String>),
-    Pr(Result<Box<PrPage>, String>),
+    /// A PR page read for `repo#number`.
+    Pr {
+        repo: String,
+        number: i64,
+        result: Result<Box<PrPage>, String>,
+    },
     /// Workflow runs, with a fresh body and ETag to save when GitHub sent one.
     Runs {
         repo: String,
@@ -198,6 +203,7 @@ pub enum Message {
     },
     /// The diff between two commits of an open PR.
     Diff {
+        repo: String,
         base: String,
         head: String,
         result: Result<String, String>,
@@ -218,7 +224,6 @@ pub enum Job {
     },
     LoadDiff {
         repo: String,
-        number: i64,
         base: String,
         head: String,
     },
@@ -1397,7 +1402,6 @@ impl App {
             pr.diff_loading = true;
             self.jobs.push(Job::LoadDiff {
                 repo: page.repo.clone(),
-                number: page.number,
                 base: page.base_oid.clone(),
                 head: page.head_oid.clone(),
             });
@@ -1432,22 +1436,36 @@ impl App {
                 self.login = Some(login);
                 self.load(Job::LoadInbox);
             }
-            Message::SignedIn(Err(error)) => self.status = error,
+            Message::SignedIn(Err(error)) => {
+                // Unconfirmed, a cached Inbox may be another account's: hide it.
+                if self.cached_login.take().is_some() {
+                    self.inbox.open = Default::default();
+                    self.inbox.merged = Default::default();
+                }
+                self.status = error;
+            }
             Message::Inbox(result) => self.inbox.open.finish(result),
             Message::Merged(result) => self.inbox.merged.finish(result),
-            Message::Pr(result) => {
-                if let Some(pr) = &mut self.pr {
+            Message::Pr {
+                repo,
+                number,
+                result,
+            } => {
+                if let Some(pr) = &mut self.pr
+                    && pr.summary.repo == repo
+                    && pr.summary.number == number
+                {
                     pr.loading = false;
                     match result {
-                        Ok(page)
-                            if page.repo == pr.summary.repo && page.number == pr.summary.number =>
-                        {
+                        Ok(page) => {
                             // A new head or base makes the old diff wrong.
                             let same = pr.page.as_ref().is_some_and(|old| {
                                 old.head_oid == page.head_oid && old.base_oid == page.base_oid
                             });
                             if !same {
+                                // A diff still on its way is for the old commits.
                                 pr.diff = None;
+                                pr.diff_loading = false;
                             }
                             // A newer version of the PR makes the history stale.
                             if pr
@@ -1461,7 +1479,6 @@ impl App {
                             pr.page = Some(*page);
                             pr.error = None;
                         }
-                        Ok(_) => {}
                         Err(error) => pr.error = Some(error),
                     }
                 }
@@ -1676,12 +1693,16 @@ impl App {
                     }));
                 }
             }
-            Message::Diff { base, head, result } => {
+            Message::Diff {
+                repo,
+                base,
+                head,
+                result,
+            } => {
                 if let Some(pr) = &mut self.pr
-                    && pr
-                        .page
-                        .as_ref()
-                        .is_some_and(|page| page.base_oid == base && page.head_oid == head)
+                    && pr.page.as_ref().is_some_and(|page| {
+                        page.repo == repo && page.base_oid == base && page.head_oid == head
+                    })
                 {
                     pr.diff_loading = false;
                     match result {
@@ -2167,6 +2188,14 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn pr_page(page: PrPage) -> Message {
+        Message::Pr {
+            repo: page.repo.clone(),
+            number: page.number,
+            result: Ok(Box::new(page)),
+        }
+    }
+
     fn press(app: &mut App, code: KeyCode) {
         app.key(KeyEvent::new(code, KeyModifiers::NONE));
     }
@@ -2293,7 +2322,7 @@ mod tests {
                 }]
             );
             app.jobs.clear();
-            app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+            app.receive(pr_page(crate::pr::tests::page()));
             let screen = draw(&mut app, 140).join("\n");
             assert!(screen.contains("feature → main"), "{screen}");
             if by_click {
@@ -2303,6 +2332,7 @@ mod tests {
             }
             assert!(matches!(app.jobs.as_slice(), [Job::LoadDiff { .. }]));
             app.receive(Message::Diff {
+                repo: "o/a".into(),
                 base: "b".repeat(40),
                 head: "a".repeat(40),
                 result: Ok("+added line".into()),
@@ -2322,7 +2352,7 @@ mod tests {
         for by_click in [false, true] {
             let mut app = signed_in();
             press(&mut app, KeyCode::Enter);
-            app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+            app.receive(pr_page(crate::pr::tests::page()));
             app.jobs.clear();
             draw(&mut app, 140);
             if by_click {
@@ -2379,9 +2409,10 @@ mod tests {
     fn open_pr(tab: PrTab) -> App {
         let mut app = signed_in();
         press(&mut app, KeyCode::Enter);
-        app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+        app.receive(pr_page(crate::pr::tests::page()));
         app.dispatch(Action::PrTab(tab));
         app.receive(Message::Diff {
+            repo: "o/a".into(),
             base: "b".repeat(40),
             head: "a".repeat(40),
             result: Ok(
@@ -2758,7 +2789,7 @@ mod tests {
     fn typing_in_the_compose_box_never_triggers_view_keys() {
         let mut app = signed_in();
         press(&mut app, KeyCode::Enter);
-        app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+        app.receive(pr_page(crate::pr::tests::page()));
         press(&mut app, KeyCode::Char('n'));
         for c in "qbw".chars() {
             press(&mut app, KeyCode::Char(c));

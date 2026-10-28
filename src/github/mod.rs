@@ -43,7 +43,8 @@ pub struct Client {
 
 impl Client {
     /// Connects to `host` (`github.com` or a GitHub Enterprise Server) with the token from
-    /// `GH_TOKEN`/`GITHUB_TOKEN`, else from `gh auth token`.
+    /// the environment variables meant for that host (see `token_variables`), else from
+    /// `gh auth token`.
     pub fn connect(host: &str) -> Result<Self> {
         let token = token(host)?;
         let agent = ureq::Agent::config_builder()
@@ -248,8 +249,19 @@ fn graphql_url(host: &str) -> String {
     }
 }
 
+/// The environment variables that hold a token for `host`, as `gh` reads them: a
+/// github.com token is never sent to an Enterprise Server, nor the other way round.
+fn token_variables(host: &str) -> [&'static str; 2] {
+    let host = host.to_ascii_lowercase();
+    if host == "github.com" || host.ends_with(".ghe.com") {
+        ["GH_TOKEN", "GITHUB_TOKEN"]
+    } else {
+        ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+    }
+}
+
 fn token(host: &str) -> Result<String> {
-    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+    for name in token_variables(host) {
         if let Ok(token) = std::env::var(name)
             && !token.trim().is_empty()
         {
@@ -281,6 +293,19 @@ fn http_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_from_the_environment_stays_with_its_host() {
+        assert_eq!(token_variables("github.com"), ["GH_TOKEN", "GITHUB_TOKEN"]);
+        assert_eq!(
+            token_variables("acme.ghe.com"),
+            ["GH_TOKEN", "GITHUB_TOKEN"]
+        );
+        assert_eq!(
+            token_variables("ghe.corp.example"),
+            ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+        );
+    }
 
     #[test]
     fn graphql_url_follows_the_host() {

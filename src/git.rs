@@ -1,8 +1,9 @@
-//! Read-only access to the local checkout through the installed `git`.
+//! The local checkout through the installed `git`.
 //!
-//! Every command only reads. `--no-optional-locks` (and `GIT_OPTIONAL_LOCKS=0`) stop
-//! `git status` from refreshing the index as a side effect; there are no prompts, pagers
-//! or external diff tools, and paths are literal.
+//! Reads (`run`) never change it: `--no-optional-locks` (and `GIT_OPTIONAL_LOCKS=0`) stop
+//! `git status` from refreshing the index as a side effect; there are no prompts, pagers,
+//! external diff tools, textconv filters or fsmonitor hooks, and paths are literal. The
+//! few writes (`write`) run only when the user asks for them.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -158,6 +159,7 @@ impl Repo {
         self.git(&[
             "show",
             "--no-ext-diff",
+            "--no-textconv",
             "--stat",
             "--patch",
             "--format=fuller",
@@ -267,8 +269,15 @@ impl Repo {
     /// The patch a stash holds (tracked changes; untracked files are listed by name).
     pub fn stash_show(&self, stash: &str) -> Result<String> {
         check_ref(stash)?;
-        self.git(&["stash", "show", "-p", "--include-untracked", stash])
-            .or_else(|_| self.git(&["stash", "show", "-p", stash]))
+        self.git(&[
+            "stash",
+            "show",
+            "-p",
+            "--no-textconv",
+            "--include-untracked",
+            stash,
+        ])
+        .or_else(|_| self.git(&["stash", "show", "-p", "--no-textconv", stash]))
     }
 
     /// What rebasing the current branch onto `onto` would replay and bring in.
@@ -353,12 +362,12 @@ impl Repo {
 
     /// Changes not yet staged.
     pub fn working_diff(&self) -> Result<String> {
-        self.git(&["diff", "--no-ext-diff"])
+        self.git(&["diff", "--no-ext-diff", "--no-textconv"])
     }
 
     /// Changes staged for the next commit.
     pub fn staged_diff(&self) -> Result<String> {
-        self.git(&["diff", "--no-ext-diff", "--cached"])
+        self.git(&["diff", "--no-ext-diff", "--no-textconv", "--cached"])
     }
 }
 
@@ -378,6 +387,9 @@ fn run(dir: &Path, args: &[&str]) -> Result<String> {
             "--no-optional-locks",
             "--no-pager",
             "--literal-pathspecs",
+            // A checkout's own config must not run programs while it is only browsed.
+            "-c",
+            "core.fsmonitor=false",
             "-c",
             "core.quotepath=false",
             "-c",
@@ -406,8 +418,16 @@ fn repo_from_url(url: &str, host: &str) -> Option<String> {
         .or_else(|| url.strip_prefix(&format!("ssh://git@{host}/")))?;
     let path = path.trim_end_matches('/').trim_end_matches(".git");
     let (owner, name) = path.split_once('/')?;
-    (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
-        .then(|| format!("{owner}/{name}"))
+    // Only names GitHub allows, so a remote cannot steer API paths (`..`, `?`, `#`).
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (valid(owner) && valid(name)).then(|| format!("{owner}/{name}"))
 }
 
 /// Runs a git command that changes the repository: staging, unstaging or committing.
@@ -786,6 +806,15 @@ mod tests {
         }
         assert_eq!(repo_from_url("git@gitlab.com:a/b.git", "github.com"), None);
         assert_eq!(repo_from_url("https://github.com/a", "github.com"), None);
+        for url in [
+            "git@github.com:../x",
+            "git@github.com:o/..",
+            "https://github.com/o/a?x=1",
+            "https://github.com/o/a#b",
+            "https://github.com/o/a/b",
+        ] {
+            assert_eq!(repo_from_url(url, "github.com"), None, "{url}");
+        }
     }
 
     #[test]

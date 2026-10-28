@@ -10,17 +10,31 @@ use std::path::{Path, PathBuf};
 
 /// The shape of what the cache stores. Bump it whenever a cached type changes meaning
 /// (a field added, a body read differently): older entries are then dropped on open.
-const FORMAT: i32 = 9;
+const FORMAT: i32 = 10;
 
 pub struct Cache {
     db: Connection,
 }
 
 impl Cache {
+    /// Opens (or creates) the cache at `path`, readable only by this user: it holds
+    /// private PR pages, diffs and logs.
     pub fn open(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
+        // Create the file first so it starts private; SQLite gives its WAL files the same mode.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let db = Connection::open(path)?;
         db.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -55,6 +69,17 @@ impl Cache {
         Some((serde_json::from_str(&value).ok()?, saved_at))
     }
 
+    /// Deletes everything saved for `login` on `host` (when another account signs in).
+    pub fn forget(&self, host: &str, login: &str) -> Result<()> {
+        let prefix = format!("{host}/{login}/");
+        // `substr` rather than LIKE, so `_` and `%` in names match only themselves.
+        self.db.execute(
+            "DELETE FROM entries WHERE substr(key, 1, length(?1)) = ?1",
+            params![prefix],
+        )?;
+        Ok(())
+    }
+
     pub fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         self.db.execute(
             "INSERT INTO entries (key, value, saved_at) VALUES (?1, ?2, ?3)
@@ -84,9 +109,9 @@ pub fn pr_key(host: &str, login: &str, repo: &str, number: i64) -> String {
     format!("{host}/{login}/pr/{repo}#{number}")
 }
 
-/// Where the diff between two commits is stored (it never changes).
-pub fn diff_key(host: &str, login: &str, base: &str, head: &str) -> String {
-    format!("{host}/{login}/diff/{base}..{head}")
+/// Where the diff between two commits of `repo` is stored (it never changes).
+pub fn diff_key(host: &str, login: &str, repo: &str, base: &str, head: &str) -> String {
+    format!("{host}/{login}/diff/{repo}/{base}...{head}")
 }
 
 /// Where a finished Actions job's log is stored (it no longer changes).
@@ -140,5 +165,24 @@ mod tests {
             reopened.get::<Vec<String>>("k").is_some(),
             "persists across opens"
         );
+    }
+
+    #[test]
+    fn the_cache_is_private_and_an_old_account_can_be_forgotten() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cache, path) = cache();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        cache.put(&inbox_key("h", "old_one"), &1).unwrap();
+        cache.put(&inbox_key("h", "oldXone"), &2).unwrap();
+        cache.put(&login_key("h"), &"old_one").unwrap();
+        cache.forget("h", "old_one").unwrap();
+        assert!(cache.get::<i32>(&inbox_key("h", "old_one")).is_none());
+        assert!(
+            cache.get::<i32>(&inbox_key("h", "oldXone")).is_some(),
+            "_ is literal"
+        );
+        assert!(cache.get::<String>(&login_key("h")).is_some());
     }
 }
