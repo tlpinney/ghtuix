@@ -50,6 +50,11 @@ pub struct Local {
     pub loading: bool,
     /// The selected file of the Working or Staged list.
     pub file: usize,
+    /// The cursor in the selected file's diff (an index into its lines, always on an
+    /// added or removed line), while hunks and lines are being staged.
+    pub line: Option<usize>,
+    /// A local write is running; another waits so it never applies to stale text.
+    pub writing: bool,
 }
 
 impl Local {
@@ -64,7 +69,81 @@ impl Local {
             scroll: 0,
             loading: false,
             file: 0,
+            line: None,
+            writing: false,
         }
+    }
+
+    /// The selected file's own diff in the current tab, as read.
+    pub fn file_diff(&self) -> Option<String> {
+        let Some(Ok(changes)) = &self.changes else {
+            return None;
+        };
+        let (path, _) = self.selected_file()?;
+        let diff = match self.tab {
+            LocalTab::Staged => &changes.staged,
+            _ => &changes.working,
+        };
+        Some(crate::git::diff_of(diff, path)).filter(|one| !one.is_empty())
+    }
+
+    /// The changed lines of the selected file's diff, in order.
+    fn change_lines(&self) -> Vec<usize> {
+        let Some(diff) = self.file_diff() else {
+            return Vec::new();
+        };
+        let Some(parsed) = crate::patch::FileDiff::parse(&diff) else {
+            return Vec::new();
+        };
+        (0..diff.lines().count())
+            .filter(|&i| parsed.is_change(i))
+            .collect()
+    }
+
+    /// Puts the cursor on the first change of the selected file; false when it has none
+    /// (a new or binary file is staged whole).
+    pub fn enter_diff(&mut self) -> bool {
+        self.line = self.change_lines().first().copied();
+        self.line.is_some()
+    }
+
+    /// Moves the cursor `delta` changed lines on.
+    pub fn move_line(&mut self, delta: isize) {
+        let changes = self.change_lines();
+        let Some(line) = self.line else { return };
+        let at = changes
+            .iter()
+            .position(|&i| i >= line)
+            .unwrap_or(changes.len().saturating_sub(1));
+        self.line = changes
+            .get(
+                at.saturating_add_signed(delta)
+                    .min(changes.len().saturating_sub(1)),
+            )
+            .copied();
+    }
+
+    /// Puts the cursor on diff line `index` if it is a change.
+    pub fn place_line(&mut self, index: usize) {
+        if self.change_lines().contains(&index) {
+            self.line = Some(index);
+        }
+    }
+
+    /// After the diff was read again, keeps the cursor on the nearest change, if any.
+    pub fn settle_line(&mut self) {
+        let Some(line) = self.line else { return };
+        let changes = self.change_lines();
+        self.line = changes
+            .iter()
+            .copied()
+            .find(|&i| i >= line)
+            .or_else(|| changes.last().copied());
+    }
+
+    /// The row of `lines()` where the selected file's diff starts.
+    fn diff_row(&self) -> usize {
+        2 + self.files().len() + 1
     }
 
     fn commit_lines(&self) -> Vec<usize> {
@@ -113,6 +192,7 @@ impl Local {
     pub fn select_file(&mut self, index: usize) {
         self.file = index.min(self.files().len().saturating_sub(1));
         self.scroll = 0;
+        self.line = None;
     }
 
     pub fn scroll_by(&mut self, delta: isize) {
@@ -144,6 +224,15 @@ impl Local {
             return hits;
         }
         let lines = self.lines();
+        // Keep the diff cursor in sight.
+        if let Some(line) = self.line {
+            let row = (self.diff_row() + line) as u16;
+            if row < self.scroll {
+                self.scroll = row;
+            } else if row >= self.scroll + inner.height {
+                self.scroll = row + 1 - inner.height;
+            }
+        }
         self.scroll = self
             .scroll
             .min((lines.len() as u16).saturating_sub(inner.height));
@@ -156,13 +245,23 @@ impl Local {
                     hits.push((rect, Action::Select(index)));
                 }
             }
+            // Each changed line takes the cursor when clicked.
+            for index in self.change_lines() {
+                let row = (self.diff_row() + index) as u16;
+                if (self.scroll..self.scroll + inner.height).contains(&row) {
+                    let rect = Rect::new(inner.x, inner.y + row - self.scroll, inner.width, 1);
+                    hits.push((rect, Action::DiffLine(index)));
+                }
+            }
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0)),
-            inner,
-        );
+        // A diff is not wrapped, so each of its lines stays one row (and one click target).
+        let paragraph = Paragraph::new(lines).scroll((self.scroll, 0));
+        let paragraph = if self.commit.is_some() {
+            paragraph.wrap(Wrap { trim: false })
+        } else {
+            paragraph
+        };
+        frame.render_widget(paragraph, inner);
         hits
     }
 
@@ -302,7 +401,11 @@ impl Local {
                 };
                 lines.push(Line::raw(format!("{what} {path}")));
             }
-            lines.extend(crate::diff::lines(&one));
+            let mut diff = crate::diff::lines(&one);
+            if let Some(line) = self.line.and_then(|line| diff.get_mut(line)) {
+                line.style = line.style.add_modifier(Modifier::REVERSED);
+            }
+            lines.extend(diff);
         }
         lines
     }

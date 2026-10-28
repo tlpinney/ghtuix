@@ -78,6 +78,10 @@ pub enum Action {
     Unstage,
     /// Write a commit message for what is staged.
     StartCommit,
+    /// Put the diff cursor on line `i` of the selected file's diff.
+    DiffLine(usize),
+    /// Stage (Working) or unstage (Staged) the one line under the diff cursor.
+    StageLine,
     /// Re-run the failed jobs of the open workflow run.
     Rerun,
     /// Cancel the open workflow run.
@@ -269,6 +273,11 @@ pub enum Job {
 pub enum GitOp {
     Stage(String),
     Unstage(String),
+    /// Stage (or, `reverse`, unstage) part of a file: a hunk or one line.
+    Apply {
+        patch: String,
+        reverse: bool,
+    },
     Commit(String),
 }
 
@@ -510,23 +519,64 @@ impl App {
                 self.local.tab = tab;
                 self.local.commit = None;
                 self.local.scroll = 0;
+                self.local.line = None;
             }
             Action::Select(index)
                 if self.view == View::Local && self.local.tab != LocalTab::History =>
             {
                 self.local.select_file(index);
             }
+            Action::DiffLine(index) => self.local.place_line(index),
+            Action::Open if self.view == View::Local && self.local.tab != LocalTab::History => {
+                if !self.local.enter_diff() {
+                    self.status = "This file has no text hunks; + stages it whole".into();
+                }
+            }
+            Action::Back if self.view == View::Local && self.local.line.is_some() => {
+                self.local.line = None;
+            }
             Action::Move(delta)
                 if self.view == View::Local && self.local.tab != LocalTab::History =>
             {
-                // Arrows move between files; paging and the wheel scroll the diff.
-                if delta.abs() == 1 && self.local.commit.is_none() {
+                // Arrows move between files, or between changes once the cursor is in the
+                // diff; paging and the wheel scroll.
+                if delta.abs() == 1 && self.local.line.is_some() {
+                    self.local.move_line(delta);
+                } else if delta.abs() == 1 && self.local.commit.is_none() {
                     self.local
                         .select_file(self.local.file.saturating_add_signed(delta));
                 } else {
                     self.local.scroll_by(delta);
                 }
             }
+            Action::Stage | Action::Unstage | Action::StageLine if self.local.line.is_some() => {
+                // Part of a file: the hunk, or the one line, under the diff cursor.
+                let reverse = self.local.tab == LocalTab::Staged;
+                if self.local.writing {
+                    self.status = "Wait for the last change to finish".into();
+                    return;
+                }
+                let (Ok(repo), Some(diff), Some(line)) =
+                    (&self.local.repo, self.local.file_diff(), self.local.line)
+                else {
+                    return;
+                };
+                let Some(parsed) = crate::patch::FileDiff::parse(&diff) else {
+                    return;
+                };
+                let patch = if action == Action::StageLine {
+                    parsed.line_patch(line, reverse)
+                } else {
+                    parsed.hunk_patch(line)
+                };
+                if let Some(patch) = patch {
+                    self.local.writing = true;
+                    let repo = repo.clone();
+                    self.jobs
+                        .push(Job::GitWrite(repo, GitOp::Apply { patch, reverse }));
+                }
+            }
+            Action::StageLine => {}
             Action::Stage | Action::Unstage => {
                 if let (Ok(repo), Some((path, _))) = (&self.local.repo, self.local.selected_file())
                 {
@@ -1265,7 +1315,10 @@ impl App {
                 self.local.history = Some(result);
                 self.local.move_selection(0);
             }
-            Message::Changes(result) => self.local.changes = Some(result),
+            Message::Changes(result) => {
+                self.local.changes = Some(result);
+                self.local.settle_line();
+            }
             Message::Commit { sha, result } => {
                 if let Some((open, shown)) = &mut self.local.commit
                     && *open == sha
@@ -1310,6 +1363,7 @@ impl App {
                     (Ok(_), false) => {}
                 }
                 // Status, diffs and (after a commit) history all changed.
+                self.local.writing = false;
                 self.local.loading = false;
                 self.load_local();
             }
@@ -1736,7 +1790,35 @@ impl App {
                 controls.push(Control::hidden(KeyCode::Esc, Action::Back));
             } else if self.local.tab == LocalTab::History {
                 controls.push(Control::new(KeyCode::Enter, "Show commit", Action::Open));
+            } else if self.local.line.is_some() {
+                if self.local.tab == LocalTab::Working {
+                    controls.push(Control::new(
+                        KeyCode::Char('+'),
+                        "Stage hunk",
+                        Action::Stage,
+                    ));
+                    controls.push(Control::new(
+                        KeyCode::Char('L'),
+                        "Stage line",
+                        Action::StageLine,
+                    ));
+                } else {
+                    controls.push(Control::new(
+                        KeyCode::Char('-'),
+                        "Unstage hunk",
+                        Action::Unstage,
+                    ));
+                    controls.push(Control::new(
+                        KeyCode::Char('L'),
+                        "Unstage line",
+                        Action::StageLine,
+                    ));
+                }
+                controls.push(Control::new(KeyCode::Char('b'), "Files", Action::Back));
+                controls.push(Control::hidden(KeyCode::Left, Action::Back));
+                controls.push(Control::hidden(KeyCode::Esc, Action::Back));
             } else {
+                controls.push(Control::new(KeyCode::Enter, "Hunks", Action::Open));
                 if self.local.tab == LocalTab::Working {
                     controls.push(Control::new(KeyCode::Char('+'), "Stage", Action::Stage));
                 } else {
@@ -3002,5 +3084,151 @@ mod tests {
         });
         assert!(matches!(app.dashboard.metrics, Some(Ok(_))));
         assert_eq!(app.status, "GitHub returned HTTP 502");
+    }
+
+    const HUNKS: &str = "diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+@@ -9,2 +9,3 @@
+ nine
++nine and a half
+ ten
+";
+
+    fn local_with_hunks(tab: LocalTab) -> App {
+        use crate::git::Status;
+        let mut app = App {
+            local: Local::new(Ok(Repo {
+                root: "/tmp/repo".into(),
+            })),
+            jobs: Vec::new(),
+            ..App::default()
+        };
+        press(&mut app, KeyCode::Char('2'));
+        press(
+            &mut app,
+            KeyCode::Char(if tab == LocalTab::Staged { 'i' } else { 'w' }),
+        );
+        app.jobs.clear();
+        let files = vec![("a.rs".to_string(), 'M')];
+        let (staged, unstaged, working, staged_diff) = if tab == LocalTab::Staged {
+            (files, Vec::new(), String::new(), HUNKS.to_string())
+        } else {
+            (Vec::new(), files, HUNKS.to_string(), String::new())
+        };
+        app.receive(Message::Changes(Ok(Changes {
+            status: Status {
+                branch: "main".into(),
+                staged,
+                unstaged,
+                ..Status::default()
+            },
+            working,
+            staged: staged_diff,
+            author: "Ada <ada@example.invalid>".into(),
+        })));
+        app
+    }
+
+    fn applied(app: &App) -> (String, bool) {
+        match &app.jobs[..] {
+            [Job::GitWrite(_, GitOp::Apply { patch, reverse })] => (patch.clone(), *reverse),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hunk_stages_by_key_or_click_and_the_files_stay_untouched_otherwise() {
+        for by_click in [false, true] {
+            let mut app = local_with_hunks(LocalTab::Working);
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(screen.contains("Enter Hunks"), "{screen}");
+            // A click picks a visible line of the first hunk; keys walk to the second.
+            let line = if by_click {
+                click(&mut app, &Action::DiffLine(6)); // "+TWO"
+                6
+            } else {
+                press(&mut app, KeyCode::Enter);
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Down);
+                10 // "+nine and a half"
+            };
+            assert_eq!(app.local.line, Some(line));
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(screen.contains("+ Stage hunk") && screen.contains("L Stage line"));
+            if by_click {
+                click(&mut app, &Action::Stage);
+            } else {
+                press(&mut app, KeyCode::Char('+'));
+            }
+            let (patch, reverse) = applied(&app);
+            assert!(!reverse);
+            let (this, other) = if by_click {
+                ("@@ -1,3 +1,3 @@", "nine and a half")
+            } else {
+                ("@@ -9,2 +9,3 @@", "TWO")
+            };
+            assert!(patch.contains(this) && !patch.contains(other), "{patch}");
+            // A second change waits for the first to finish.
+            app.jobs.clear();
+            press(&mut app, KeyCode::Char('+'));
+            assert!(app.jobs.is_empty());
+            assert_eq!(app.status, "Wait for the last change to finish");
+            app.receive(Message::GitDone {
+                commit: false,
+                result: Ok(String::new()),
+            });
+            assert!(!app.local.writing);
+        }
+    }
+
+    #[test]
+    fn one_line_stages_or_unstages_with_the_other_lines_rewritten() {
+        let mut app = local_with_hunks(LocalTab::Working);
+        press(&mut app, KeyCode::Enter); // on "-two"
+        assert_eq!(app.local.line, Some(5));
+        press(&mut app, KeyCode::Char('L'));
+        let (patch, reverse) = applied(&app);
+        assert!(!reverse);
+        assert!(
+            patch.ends_with("@@ -1,3 +1,3 @@\n one\n-two\n three\n"),
+            "{patch}"
+        );
+
+        let mut app = local_with_hunks(LocalTab::Staged);
+        draw(&mut app, 120);
+        click(&mut app, &Action::DiffLine(6)); // "+TWO"
+        draw(&mut app, 120);
+        click(&mut app, &Action::StageLine);
+        let (patch, reverse) = applied(&app);
+        assert!(reverse, "unstaging applies in reverse");
+        assert!(
+            patch.ends_with("@@ -1,3 +1,3 @@\n one\n+TWO\n three\n"),
+            "{patch}"
+        );
+    }
+
+    #[test]
+    fn the_cursor_settles_after_a_reload_and_back_returns_to_files() {
+        let mut app = local_with_hunks(LocalTab::Working);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.local.line, Some(10));
+        // The first hunk was staged elsewhere: its lines are gone from the working diff.
+        let rest = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -9,2 +9,3 @@\n nine\n+nine and a half\n ten\n";
+        if let Some(Ok(changes)) = &mut app.local.changes {
+            changes.working = rest.into();
+        }
+        app.local.settle_line();
+        assert_eq!(app.local.line, Some(5), "the nearest change that is left");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.local.line, None);
+        assert_eq!(app.view, View::Local);
     }
 }

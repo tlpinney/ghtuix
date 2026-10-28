@@ -15,6 +15,7 @@ mod log;
 mod markdown;
 mod model;
 mod notifications;
+mod patch;
 mod picker;
 mod pr;
 mod search;
@@ -383,6 +384,9 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                     app::GitOp::Stage(path) => repo.stage(&path).map(|()| String::new()),
                     app::GitOp::Unstage(path) => repo.unstage(&path).map(|()| String::new()),
                     app::GitOp::Commit(message) => repo.commit(&message),
+                    app::GitOp::Apply { patch, reverse } => {
+                        repo.apply_cached(&patch, reverse).map(|()| String::new())
+                    }
                 };
                 Message::GitDone {
                     commit,

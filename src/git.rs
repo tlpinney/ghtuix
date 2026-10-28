@@ -131,6 +131,17 @@ impl Repo {
         }
     }
 
+    /// Applies `patch` to the index only (the working tree is untouched); `reverse` takes
+    /// it out again. Git refuses a patch that no longer fits, as when the file changed.
+    pub fn apply_cached(&self, patch: &str, reverse: bool) -> Result<()> {
+        let mut args = vec!["apply", "--cached", "--recount"];
+        if reverse {
+            args.push("--reverse");
+        }
+        args.push("-");
+        write(&self.root, &args, Some(patch)).map(|_| ())
+    }
+
     /// Commits what is staged with `message`; returns the new commit's id.
     pub fn commit(&self, message: &str) -> Result<String> {
         write(&self.root, &["commit", "-q", "-F", "-"], Some(message))?;
@@ -399,6 +410,58 @@ mod tests {
         assert_eq!(history[0].commit.as_ref().unwrap().subject, "Second commit");
         assert!(repo.status().unwrap().staged.is_empty());
         assert!(repo.author().unwrap().contains('<'));
+    }
+
+    #[test]
+    fn stages_and_unstages_one_line_or_one_hunk_of_a_file() {
+        use crate::patch::FileDiff;
+        let (repo, dir) = repo();
+        repo.stage("a.txt").unwrap();
+        repo.commit("Base").unwrap();
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("b.txt"), &body).unwrap();
+        repo.stage("b.txt").unwrap();
+        repo.commit("Add b").unwrap();
+        let edited = body
+            .replace("line 2\n", "line two\nline 2b\n")
+            .replace("line 18\n", "line eighteen\n");
+        std::fs::write(dir.join("b.txt"), &edited).unwrap();
+        let working = diff_of(&repo.working_diff().unwrap(), "b.txt");
+        let diff = FileDiff::parse(&working).unwrap();
+        let line = |text: &str| working.lines().position(|l| l == text).unwrap();
+        // One line: only "+line two" (and the removal it replaces stays unstaged).
+        let patch = diff.line_patch(line("+line two"), false).unwrap();
+        repo.apply_cached(&patch, false).unwrap();
+        let staged = repo.staged_diff().unwrap();
+        assert!(
+            staged.contains("+line two") && !staged.contains("+line 2b"),
+            "{staged}"
+        );
+        assert!(!staged.contains("-line 2\n"), "the removal was not chosen");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            edited,
+            "the working tree is untouched"
+        );
+        // A whole hunk: the change near line 18.
+        let patch = diff.hunk_patch(line("+line eighteen")).unwrap();
+        repo.apply_cached(&patch, false).unwrap();
+        assert!(repo.staged_diff().unwrap().contains("+line eighteen"));
+        // The same patch no longer fits the index, so git refuses it.
+        assert!(repo.apply_cached(&patch, false).is_err());
+        // Unstage just "+line two" from the staged diff.
+        let staged = diff_of(&repo.staged_diff().unwrap(), "b.txt");
+        let at = staged.lines().position(|l| l == "+line two").unwrap();
+        let patch = FileDiff::parse(&staged)
+            .unwrap()
+            .line_patch(at, true)
+            .unwrap();
+        repo.apply_cached(&patch, true).unwrap();
+        let staged = repo.staged_diff().unwrap();
+        assert!(
+            !staged.contains("line two") && staged.contains("+line eighteen"),
+            "{staged}"
+        );
     }
 
     #[test]

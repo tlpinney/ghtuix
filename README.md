@@ -59,9 +59,13 @@ with where they stand, and commenters, bots included.
 | `g` `w` `i` | History (git's graph of every branch) · Working changes · Staged changes |
 | `Enter` (History) | Show the selected commit |
 | `+` / `-` | Stage / unstage the selected file |
+| `Enter` (Working, Staged) or click a changed line | Put a cursor in the file's diff; `↑/↓` step between changed lines |
+| `+` / `-` · `L` (in the diff) | Stage / unstage the hunk under the cursor · just that line (`b` back to the files) |
 | `K` | Commit what is staged (preview shows branch, author, files and message) |
 
-Browsing never changes the checkout: git runs with `--no-optional-locks`, so even
+A hunk or line is staged with `git apply --cached` (`--reverse` to unstage), so the
+working tree is never touched; if the file changed since it was read, git refuses the
+patch and the error shows. Browsing never changes the checkout: git runs with `--no-optional-locks`, so even
 `git status` does not touch the index.
 
 ### 3 Actions
