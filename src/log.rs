@@ -5,9 +5,9 @@ use crate::app::Action;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +100,7 @@ impl LogView {
             ])),
             title,
         );
-        let block = Block::default().borders(Borders::ALL).title(" Log ");
+        let block = crate::theme::pane(" Log ");
         let inner = block.inner(body);
         frame.render_widget(block, body);
         let lines = match &self.lines {
@@ -118,11 +118,11 @@ impl LogView {
                         let mut style = match kind {
                             Kind::Plain => Style::default(),
                             Kind::Group => Style::default().add_modifier(Modifier::BOLD),
-                            Kind::Warning => Style::default().fg(Color::Yellow),
-                            Kind::Failure => Style::default().fg(Color::Red),
+                            Kind::Warning => Style::default().fg(crate::theme::p().yellow),
+                            Kind::Failure => Style::default().fg(crate::theme::p().red),
                         };
                         if Some(index) == self.at {
-                            style = style.add_modifier(Modifier::REVERSED);
+                            style = style.patch(crate::theme::selected());
                         }
                         Line::styled(text.clone(), style)
                     })

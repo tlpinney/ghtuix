@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 /// What the picker is choosing, so the app knows what its answer means.
@@ -17,6 +17,7 @@ pub enum Purpose {
     PrMenu,
     Labels,
     Reviewers,
+    Theme,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +48,8 @@ pub struct Picker {
     pub filter: String,
     /// Index into `shown()`.
     pub selected: usize,
+    /// What Cancel puts back (the theme picker previews as it moves).
+    pub restore: Option<String>,
 }
 
 impl Picker {
@@ -58,6 +61,7 @@ impl Picker {
             items: None,
             filter: String::new(),
             selected: 0,
+            restore: None,
         }
     }
 
@@ -124,9 +128,7 @@ impl Picker {
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let rect = Rect::new(x, y, width, height);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", self.title));
+        let block = crate::theme::pane(format!(" {} ", self.title));
         let inner = block.inner(rect);
         frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);
@@ -154,7 +156,7 @@ impl Picker {
                         (true, false) => "[ ] ",
                     };
                     let style = if row == self.selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
+                        crate::theme::selected()
                     } else {
                         Style::default()
                     };

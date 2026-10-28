@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Cell, Paragraph, Row, Table},
 };
 
 /// One run opened from the list.
@@ -86,7 +86,7 @@ impl ActionsView {
         let repo = match &self.repo {
             Ok(repo) => repo.clone(),
             Err(error) => {
-                let block = Block::default().borders(Borders::ALL).title(" Actions ");
+                let block = crate::theme::pane(" Actions ");
                 frame.render_widget(Paragraph::new(error.clone()).block(block), area);
                 return Vec::new();
             }
@@ -98,9 +98,7 @@ impl ActionsView {
     }
 
     fn draw_runs(&self, frame: &mut Frame, area: Rect, repo: &str) -> Vec<(Rect, Action)> {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {repo} · runs "));
+        let block = crate::theme::pane(format!(" {repo} · runs "));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let runs = match &self.runs {
@@ -120,7 +118,7 @@ impl ActionsView {
             .take(shown)
             .map(|(index, run)| {
                 let style = if index == self.selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                    crate::theme::selected()
                 } else {
                     Style::default()
                 };
@@ -168,7 +166,7 @@ fn draw_run(frame: &mut Frame, area: Rect, repo: &str, open: &OpenRun) -> Vec<(R
         run.run_number,
         run.outcome()
     );
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = crate::theme::pane(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let jobs = match &open.jobs {
@@ -181,7 +179,7 @@ fn draw_run(frame: &mut Frame, area: Rect, repo: &str, open: &OpenRun) -> Vec<(R
     let mut hits = Vec::new();
     for (index, job) in jobs.iter().enumerate() {
         let style = if index == open.selected {
-            Style::default().add_modifier(Modifier::REVERSED)
+            crate::theme::selected()
         } else {
             Style::default()
         };
@@ -239,9 +237,9 @@ fn row_hits(area: Rect, top: usize, count: usize, header: u16) -> Vec<(Rect, Act
 
 fn colour(state: Checks) -> (&'static str, Color) {
     match state {
-        Checks::Passing => ("✓", Color::Green),
-        Checks::Failing => ("✗", Color::Red),
-        Checks::Pending | Checks::None => ("•", Color::Yellow),
+        Checks::Passing => ("✓", crate::theme::p().green),
+        Checks::Failing => ("✗", crate::theme::p().red),
+        Checks::Pending | Checks::None => ("•", crate::theme::p().yellow),
     }
 }
 

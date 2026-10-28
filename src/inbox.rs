@@ -7,8 +7,8 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    text::Line,
+    widgets::{Cell, Paragraph, Row, Table, Wrap},
 };
 
 /// Width from which the preview sits beside the list.
@@ -162,33 +162,11 @@ impl Inbox {
     }
 
     fn draw_tabs(&self, frame: &mut Frame, area: Rect) -> Vec<(Rect, Action)> {
-        let mut spans = Vec::new();
-        let mut hits = Vec::new();
-        let mut x = area.x + 1;
-        for (tab, key, label) in Tab::ALL {
-            let text = format!("{key} {label}");
-            let width = text.chars().count() as u16;
-            if x + width > area.right() {
-                break;
-            }
-            let style = if tab == self.tab {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(text, style));
-            spans.push(Span::raw("   "));
-            hits.push((Rect::new(x, area.y, width, 1), Action::Tab(tab)));
-            x += width + 3;
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: area.x + 1,
-                ..area
-            },
-        );
-        hits
+        let tabs: Vec<_> = Tab::ALL
+            .iter()
+            .map(|(tab, key, label)| (key.to_string(), *label, *tab == self.tab, Action::Tab(*tab)))
+            .collect();
+        crate::theme::tabs(frame, area, &tabs)
     }
 
     fn summary(&self) -> String {
@@ -222,9 +200,7 @@ impl Inbox {
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect) -> Vec<(Rect, Action)> {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Pull requests ");
+        let block = crate::theme::pane(" Pull requests ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let visible = self.visible();
@@ -247,7 +223,7 @@ impl Inbox {
             .take(rows_shown)
             .map(|(index, pr)| {
                 let style = if index == self.selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                    crate::theme::selected()
                 } else {
                     Style::default()
                 };
@@ -297,7 +273,7 @@ impl Inbox {
     }
 
     fn draw_preview(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(" Preview ");
+        let block = crate::theme::pane(" Preview ");
         let Some(pr) = self.selected_pr() else {
             frame.render_widget(
                 Paragraph::new("No pull request selected").block(block),

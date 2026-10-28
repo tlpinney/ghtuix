@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    widgets::{Cell, Paragraph, Row, Table, Wrap},
 };
 
 /// Where a record leads.
@@ -109,13 +109,13 @@ impl DashboardView {
         let repo = match &self.repo {
             Ok(repo) => repo,
             Err(error) => {
-                let block = Block::default().borders(Borders::ALL).title(" Dashboard ");
+                let block = crate::theme::pane(" Dashboard ");
                 frame.render_widget(Paragraph::new(error.clone()).block(block), area);
                 return Vec::new();
             }
         };
         let title = format!(" {repo} · last {} days ", self.days);
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::theme::pane(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let note = match &self.metrics {
@@ -152,14 +152,11 @@ fn draw_cards(
             break;
         }
         let style = if index == selected {
-            Style::default().add_modifier(Modifier::REVERSED)
+            crate::theme::selected()
         } else {
             Style::default()
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", card.title))
-            .title_style(style);
+        let block = crate::theme::pane(format!(" {} ", card.title)).title_style(style);
         let lines = vec![
             Line::styled(
                 card.value.clone(),
@@ -198,7 +195,7 @@ fn draw_records(frame: &mut Frame, area: Rect, card: &Card, row: usize) -> Vec<(
         .take(shown)
         .map(|(index, record)| {
             let style = if index == row {
-                Style::default().add_modifier(Modifier::REVERSED)
+                crate::theme::selected()
             } else {
                 Style::default()
             };

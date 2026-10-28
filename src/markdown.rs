@@ -3,7 +3,7 @@
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
@@ -74,7 +74,10 @@ impl Renderer {
         }
         let mut spans = vec![Span::raw(self.prefix())];
         if let Some(marker) = self.marker.take() {
-            spans.push(Span::styled(marker, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                marker,
+                Style::default().fg(crate::theme::p().sky),
+            ));
         }
         spans.append(&mut self.spans);
         self.lines.push(Line::from(spans));
@@ -93,7 +96,7 @@ impl Renderer {
             Event::End(tag) => self.end(tag),
             Event::Text(text) if self.code => {
                 for line in text.lines() {
-                    let code = Style::default().fg(Color::Yellow);
+                    let code = Style::default().fg(crate::theme::p().yellow);
                     let prefix = format!("{}    ", self.prefix());
                     self.lines.push(Line::from(vec![
                         Span::raw(prefix),
@@ -105,7 +108,10 @@ impl Renderer {
                 let style = self.style();
                 self.push(text.to_string(), style);
             }
-            Event::Code(code) => self.push(code.to_string(), Style::default().fg(Color::Yellow)),
+            Event::Code(code) => self.push(
+                code.to_string(),
+                Style::default().fg(crate::theme::p().yellow),
+            ),
             Event::Html(html) | Event::InlineHtml(html) => {
                 let text = self.strip_html(&html);
                 let style = self.style();

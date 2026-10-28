@@ -21,8 +21,6 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
     widgets::Paragraph,
 };
 
@@ -103,6 +101,8 @@ pub enum Action {
     /// Mark the selected notification read, or done.
     MarkRead,
     MarkDone,
+    /// Choose the colour theme (previewed as the selection moves).
+    ThemeMenu,
     /// Open the PR actions menu (close, draft, title, labels, reviewers).
     PrMenu,
     /// Click on row `i` of the open picker: choose it, or toggle it in a multi picker.
@@ -389,7 +389,8 @@ impl App {
             }
         }
         if let (Some(picker), Action::Move(delta)) = (&mut self.picker, &action) {
-            return picker.move_selection(*delta);
+            picker.move_selection(*delta);
+            return self.preview_theme();
         }
         match action {
             Action::Show(view) => {
@@ -882,7 +883,28 @@ impl App {
                     picker.toggle(row);
                 }
             }
-            Action::PickerCancel => self.picker = None,
+            Action::PickerCancel => {
+                // Leaving the theme picker puts the theme back as it was.
+                if let Some(picker) = self.picker.take()
+                    && let Some(original) = picker.restore
+                {
+                    crate::theme::set(&original);
+                }
+            }
+            Action::ThemeMenu => {
+                let current = crate::theme::p().name;
+                let mut picker = Picker::new(Purpose::Theme, "Theme", false);
+                picker.items = Some(Ok(crate::theme::names()
+                    .into_iter()
+                    .map(|name| Item::new(name, name))
+                    .collect()));
+                picker.selected = crate::theme::names()
+                    .iter()
+                    .position(|name| *name == current)
+                    .unwrap_or(0);
+                picker.restore = Some(current.to_owned());
+                self.picker = Some(picker);
+            }
             Action::PickerDone => self.picker_done(),
             Action::CommentLine | Action::ReplyThread | Action::ToggleResolve => {
                 if let Some(kind) = self.cursor_write(&action) {
@@ -1037,14 +1059,33 @@ impl App {
         }
     }
 
+    /// Shows the theme under the theme picker's cursor.
+    fn preview_theme(&mut self) {
+        if let Some(picker) = &self.picker
+            && picker.purpose == Purpose::Theme
+            && let Some(item) = picker.current()
+        {
+            crate::theme::set(&item.id);
+        }
+    }
+
     /// Acts on the open picker's choice: a menu item, or the checked labels or reviewers.
     fn picker_done(&mut self) {
         let Some(picker) = &self.picker else { return };
+        if picker.purpose == Purpose::Theme {
+            if let Some(name) = picker.current().map(|item| item.id.clone()) {
+                crate::theme::set(&name);
+                self.status = format!("Theme {name} • theme = \"{name}\" in config.toml keeps it");
+            }
+            self.picker = None;
+            return;
+        }
         let Some(page) = self.pr.as_ref().and_then(|pr| pr.page.as_ref()) else {
             self.picker = None;
             return;
         };
         match picker.purpose {
+            Purpose::Theme => {}
             Purpose::PrMenu => {
                 let Some(id) = picker.current().map(|item| item.id.clone()) else {
                     return;
@@ -1700,6 +1741,8 @@ impl App {
                 }
                 _ => None,
             };
+            // Filtering moves the theme picker's cursor too.
+            self.preview_theme();
             if let Some(action) = action {
                 self.dispatch(action);
             }
@@ -2035,9 +2078,13 @@ impl App {
             );
         }
         controls.push(Control::new(KeyCode::Char('r'), "Refresh", Action::Refresh));
-        controls.extend(View::ALL.iter().map(|(view, key, label)| {
-            Control::new(KeyCode::Char(*key), label, Action::Show(*view))
-        }));
+        // The header shows the views; their keys stay here, off the bar.
+        controls.extend(
+            View::ALL
+                .iter()
+                .map(|(view, key, _)| Control::hidden(KeyCode::Char(*key), Action::Show(*view))),
+        );
+        controls.push(Control::new(KeyCode::Char('T'), "Theme", Action::ThemeMenu));
         controls.push(Control::new(KeyCode::Char('q'), "Quit", Action::Quit));
         controls
     }
@@ -2050,17 +2097,26 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(frame.area());
+        // The theme's background under everything.
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(crate::theme::base()),
+            frame.area(),
+        );
         let account = self
             .login
             .as_deref()
             .map_or(String::new(), |login| format!("@{login}"));
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" ghtuix ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(account),
-            ])),
-            header,
-        );
+        // The PR view belongs to the view it was opened from.
+        let shown = if self.pr.is_some() {
+            self.pr_from
+        } else {
+            self.view
+        };
+        let views: Vec<_> = View::ALL
+            .iter()
+            .map(|(view, key, label)| (*key, *label, *view == shown, Action::Show(*view)))
+            .collect();
+        let header_hits = crate::theme::header(frame, header, &views, &account);
         let mut hits = match (self.view, &mut self.log) {
             (_, Some(log)) => log.draw(frame, body),
             (View::Inbox, None) => match &mut self.pr {
@@ -2077,7 +2133,11 @@ impl App {
             .api_note
             .as_deref()
             .map_or(String::new(), |note| format!("  •  {note}"));
-        frame.render_widget(Paragraph::new(format!(" {}{note}", self.status)), status);
+        frame.render_widget(
+            Paragraph::new(format!(" {}{note}", self.status)).style(crate::theme::muted()),
+            status,
+        );
+        hits.extend(header_hits);
         hits.extend(keybar::draw(frame, bar, &self.controls()));
         // A picker or the compose box sits over everything; only its own targets answer.
         if let Some(picker) = &self.picker {
@@ -2087,6 +2147,7 @@ impl App {
             let login = self.login.as_deref().unwrap_or("?");
             hits = compose.draw(frame, body, login);
         }
+        crate::theme::strip_colour(frame.buffer_mut());
         self.hits = hits;
     }
 }
@@ -3641,5 +3702,45 @@ mod tests {
             app.jobs.clear();
             app.compose = None;
         }
+    }
+
+    #[test]
+    fn the_header_shows_every_view_and_switches_by_click() {
+        let mut app = signed_in();
+        let screen = draw(&mut app, 140);
+        assert!(screen[0].contains(" ghtuix ") && screen[0].contains("@octocat"));
+        assert!(screen[0].contains("1 Inbox") && screen[0].contains("6 Dashboard"));
+        assert!(
+            !screen[19].contains("6 Dashboard"),
+            "views leave the key bar"
+        );
+        click(&mut app, &Action::Show(View::Notifications));
+        assert_eq!(app.view, View::Notifications);
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.view, View::Inbox, "the view keys still work");
+    }
+
+    #[test]
+    fn the_theme_picker_previews_restores_and_keeps() {
+        let mut app = signed_in();
+        let start = crate::theme::p().name;
+        press(&mut app, KeyCode::Char('T'));
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(
+            screen.contains("dracula") && screen.contains("tokyo-night"),
+            "{screen}"
+        );
+        press(&mut app, KeyCode::Down);
+        let previewed = crate::theme::p().name;
+        assert_ne!(previewed, start, "moving previews the theme");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(crate::theme::p().name, start, "Esc puts it back");
+        press(&mut app, KeyCode::Char('T'));
+        type_text(&mut app, "nord");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(crate::theme::p().name, "nord");
+        assert!(app.status.contains(r#"theme = "nord""#), "{}", app.status);
+        crate::theme::set(start);
+        assert!(!crate::theme::set("no-such-theme"));
     }
 }

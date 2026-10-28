@@ -25,7 +25,7 @@ ghtuix
 Every control on screen is clickable and shows its key. Writes always show a preview of
 exactly what will happen and wait for **Enter** to confirm; **Esc** steps back.
 
-**Everywhere:** `1` Inbox, `2` Local, `3` Actions, `4` Notifications, `5` Search, `6` Dashboard · `r` refresh · `q` quit ·
+**Everywhere:** `1` Inbox, `2` Local, `3` Actions, `4` Notifications, `5` Search, `6` Dashboard · `r` refresh · `T` theme · `q` quit ·
 `↑/↓` or `j/k` move · PgUp/PgDn and the wheel scroll.
 
 ### 1 Inbox
@@ -127,7 +127,13 @@ Actions read.
 ```toml
 host = "github.com"                       # or a GitHub Enterprise Server host
 excluded_repositories = ["owner/noisy"]   # never shown in the Inbox
+theme = "catppuccin-mocha"                # the default; see below
 ```
+
+**Themes:** `catppuccin-mocha` (default), `catppuccin-latte` (light), `tokyo-night`,
+`dracula`, `gruvbox-dark`, `nord`, and `terminal` (your terminal's own colours and
+background). `T` previews them live; `theme = "…"` in the config keeps one.
+`NO_COLOR=1` turns colour off.
 
 ## Speed and GitHub's limits
 

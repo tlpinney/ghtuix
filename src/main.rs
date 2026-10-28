@@ -19,6 +19,7 @@ mod patch;
 mod picker;
 mod pr;
 mod search;
+mod theme;
 mod time;
 
 use anyhow::Result;
@@ -39,6 +40,15 @@ type Session = Arc<Mutex<Option<github::Client>>>;
 
 fn main() -> Result<()> {
     let config = config::Config::load()?;
+    if let Some(name) = &config.theme
+        && !theme::set(name)
+    {
+        anyhow::bail!(
+            "Unknown theme “{name}” in {}; choose one of: {}",
+            config::path().map_or(String::new(), |p| p.display().to_string()),
+            theme::names().join(", ")
+        );
+    }
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let result = run(&mut terminal, config);

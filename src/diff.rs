@@ -2,7 +2,7 @@
 
 use crate::model::Side;
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Line,
 };
 
@@ -16,11 +16,11 @@ pub fn line(text: &str) -> Line<'static> {
     let style = if text.starts_with("diff --git") || text.starts_with("commit ") {
         Style::default().add_modifier(Modifier::BOLD)
     } else if text.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(crate::theme::p().sky)
     } else if text.starts_with('+') && !text.starts_with("+++") {
-        Style::default().fg(Color::Green)
+        Style::default().fg(crate::theme::p().green)
     } else if text.starts_with('-') && !text.starts_with("---") {
-        Style::default().fg(Color::Red)
+        Style::default().fg(crate::theme::p().red)
     } else {
         Style::default()
     };
@@ -118,10 +118,10 @@ mod tests {
 
     #[test]
     fn colours_follow_the_line_kind() {
-        assert_eq!(line("+added").style.fg, Some(Color::Green));
-        assert_eq!(line("-removed").style.fg, Some(Color::Red));
+        assert_eq!(line("+added").style.fg, Some(crate::theme::p().green));
+        assert_eq!(line("-removed").style.fg, Some(crate::theme::p().red));
         assert_eq!(line("+++ b/x").style.fg, None);
-        assert_eq!(line("@@ -1 +1 @@").style.fg, Some(Color::Cyan));
+        assert_eq!(line("@@ -1 +1 @@").style.fg, Some(crate::theme::p().sky));
         assert_eq!(line("\tindented").to_string(), "    indented");
     }
 }

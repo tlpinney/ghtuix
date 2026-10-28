@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +133,7 @@ impl PrView {
         );
         let mut hits = self.draw_tabs(frame, tabs);
         let (mut lines, anchors) = self.content();
-        let block = Block::default().borders(Borders::ALL);
+        let block = crate::theme::pane("");
         let inner = block.inner(content);
         // The diff is not wrapped, so every diff line is one row and can be clicked.
         let wrap = self.tab != PrTab::Files;
@@ -160,9 +160,7 @@ impl PrView {
             } else if row >= self.scroll + inner.height {
                 self.scroll = row + 1 - inner.height;
             }
-            lines[*line] = lines[*line]
-                .clone()
-                .style(Style::default().add_modifier(Modifier::REVERSED));
+            lines[*line] = lines[*line].clone().style(crate::theme::selected());
         }
         self.scroll = self.scroll.min((total as u16).saturating_sub(inner.height));
         for (index, (line, _)) in anchors.iter().enumerate() {
@@ -183,30 +181,18 @@ impl PrView {
     }
 
     fn draw_tabs(&self, frame: &mut Frame, area: Rect) -> Vec<(Rect, Action)> {
-        let mut spans = Vec::new();
-        let mut hits = Vec::new();
-        let mut x = area.x + 1;
-        for (tab, key, label) in PrTab::ALL {
-            let text = format!("{key} {label}");
-            let width = text.chars().count() as u16;
-            let style = if tab == self.tab {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(text, style));
-            spans.push(Span::raw("   "));
-            hits.push((Rect::new(x, area.y, width, 1), Action::PrTab(tab)));
-            x += width + 3;
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: area.x + 1,
-                ..area
-            },
-        );
-        hits
+        let tabs: Vec<_> = PrTab::ALL
+            .iter()
+            .map(|(tab, key, label)| {
+                (
+                    key.to_string(),
+                    *label,
+                    *tab == self.tab,
+                    Action::PrTab(*tab),
+                )
+            })
+            .collect();
+        crate::theme::tabs(frame, area, &tabs)
     }
 
     /// The current tab's lines.
@@ -393,7 +379,7 @@ fn commits(commits: Option<&Result<Vec<PrCommit>, String>>) -> Vec<Line<'static>
             Span::styled(format!("{mark} "), Style::default().fg(color)),
             Span::styled(
                 commit.oid.chars().take(8).collect::<String>(),
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(crate::theme::p().accent),
             ),
             Span::raw(format!(" {}", commit.headline)),
             Span::styled(
@@ -434,9 +420,9 @@ fn timeline(events: Option<&Result<Vec<Event>, String>>) -> Vec<Line<'static>> {
 
 fn check_mark(state: Checks) -> (&'static str, Color) {
     match state {
-        Checks::Passing => ("✓", Color::Green),
-        Checks::Failing => ("✗", Color::Red),
-        Checks::Pending => ("•", Color::Yellow),
+        Checks::Passing => ("✓", crate::theme::p().green),
+        Checks::Failing => ("✗", crate::theme::p().red),
+        Checks::Pending => ("•", crate::theme::p().yellow),
         Checks::None => (" ", Color::Reset),
     }
 }
@@ -453,9 +439,9 @@ fn checks(page: &PrPage) -> (Vec<Line<'static>>, Vec<(usize, Anchor)>) {
         .iter()
         .map(|check| {
             let (mark, color) = match check.state {
-                Checks::Passing => ("✓", Color::Green),
-                Checks::Failing => ("✗", Color::Red),
-                Checks::Pending | Checks::None => ("•", Color::Yellow),
+                Checks::Passing => ("✓", crate::theme::p().green),
+                Checks::Failing => ("✗", crate::theme::p().red),
+                Checks::Pending | Checks::None => ("•", crate::theme::p().yellow),
             };
             Line::from(vec![
                 Span::styled(format!("{mark} "), Style::default().fg(color)),

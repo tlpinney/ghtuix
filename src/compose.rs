@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +245,7 @@ impl Compose {
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let rect = Rect::new(x, y, width, height);
         let title = format!(" {} • {} ", self.kind.label(), self.target.reference);
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::theme::pane(title);
         let inner = block.inner(rect);
         frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);

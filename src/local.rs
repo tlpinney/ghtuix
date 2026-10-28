@@ -6,9 +6,9 @@ use crate::time;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,16 +273,13 @@ impl Local {
             Ok(repo) => repo.root.display().to_string(),
             Err(error) => {
                 frame.render_widget(
-                    Paragraph::new(error.clone())
-                        .block(Block::default().borders(Borders::ALL).title(" Local ")),
+                    Paragraph::new(error.clone()).block(crate::theme::pane(" Local ")),
                     content,
                 );
                 return hits;
             }
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {root} "));
+        let block = crate::theme::pane(format!(" {root} "));
         let inner = block.inner(content);
         frame.render_widget(block, content);
         if self.tab == LocalTab::History && self.commit.is_none() {
@@ -336,30 +333,18 @@ impl Local {
     }
 
     fn draw_tabs(&self, frame: &mut Frame, area: Rect) -> Vec<(Rect, Action)> {
-        let mut spans = Vec::new();
-        let mut hits = Vec::new();
-        let mut x = area.x + 1;
-        for (tab, key, label) in LocalTab::ALL {
-            let text = format!("{key} {label}");
-            let width = text.chars().count() as u16;
-            let style = if tab == self.tab {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(text, style));
-            spans.push(Span::raw("   "));
-            hits.push((Rect::new(x, area.y, width, 1), Action::LocalTab(tab)));
-            x += width + 3;
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: area.x + 1,
-                ..area
-            },
-        );
-        hits
+        let tabs: Vec<_> = LocalTab::ALL
+            .iter()
+            .map(|(tab, key, label)| {
+                (
+                    key.to_string(),
+                    *label,
+                    *tab == self.tab,
+                    Action::LocalTab(*tab),
+                )
+            })
+            .collect();
+        crate::theme::tabs(frame, area, &tabs)
     }
 
     /// The Branches or Stash list, under a banner while a rebase waits.
@@ -379,7 +364,7 @@ impl Local {
         if refs.operation.is_some() {
             lines.push(Line::styled(
                 "A rebase stopped. Fix the conflicts and stage them (w Working), then C Continue or X Abort.",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(crate::theme::p().yellow).add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::raw(""));
         }
@@ -395,7 +380,7 @@ impl Local {
                         Line::from(vec![
                             Span::styled(
                                 format!("{:<11}", stash.name),
-                                Style::default().fg(Color::Magenta),
+                                Style::default().fg(crate::theme::p().accent),
                             ),
                             Span::styled(
                                 format!("{:>4}  ", time::age(&stash.date)),
@@ -413,13 +398,13 @@ impl Local {
                     let mark = if branch.current { "* " } else { "  " };
                     let mut spans = vec![Span::styled(
                         format!("{mark}{}", branch.name),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(if branch.current {
+                        Style::default().fg(crate::theme::p().green).add_modifier(
+                            if branch.current {
                                 Modifier::BOLD
                             } else {
                                 Modifier::empty()
-                            }),
+                            },
+                        ),
                     )];
                     if let Some(upstream) = &branch.upstream {
                         let track = if branch.track.is_empty() {
@@ -429,7 +414,7 @@ impl Local {
                         };
                         spans.push(Span::styled(
                             format!(" → {upstream}{track}"),
-                            Style::default().fg(Color::Cyan),
+                            Style::default().fg(crate::theme::p().sky),
                         ));
                     }
                     spans.push(Span::styled(
@@ -451,7 +436,7 @@ impl Local {
         let mut hits = Vec::new();
         for (index, line) in rows.into_iter().enumerate().skip(top).take(room) {
             let line = if index == selected && count > 0 {
-                line.style(Style::default().add_modifier(Modifier::REVERSED))
+                line.style(crate::theme::selected())
             } else {
                 line
             };
@@ -484,18 +469,18 @@ impl Local {
         for (index, line) in lines.iter().enumerate().skip(top).take(rows) {
             let mut spans = vec![Span::styled(
                 line.graph.clone(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::p().yellow),
             )];
             if let Some(commit) = &line.commit {
                 spans.push(Span::styled(
                     commit.sha.chars().take(8).collect::<String>(),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(crate::theme::p().accent),
                 ));
                 spans.push(Span::raw(" "));
                 if !commit.refs.is_empty() {
                     spans.push(Span::styled(
                         format!("({}) ", commit.refs),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(crate::theme::p().sky),
                     ));
                 }
                 spans.push(Span::raw(commit.subject.clone()));
@@ -507,7 +492,7 @@ impl Local {
                 hits.push((Rect::new(area.x, y, area.width, 1), Action::Select(index)));
             }
             let style = if index == self.selected {
-                Style::default().add_modifier(Modifier::REVERSED)
+                crate::theme::selected()
             } else {
                 Style::default()
             };
@@ -557,7 +542,7 @@ impl Local {
         for (index, (path, code)) in files.iter().enumerate() {
             let line = Line::raw(format!("  {code} {path}"));
             lines.push(if index == self.file {
-                line.style(Style::default().add_modifier(Modifier::REVERSED))
+                line.style(crate::theme::selected())
             } else {
                 line
             });
@@ -576,7 +561,7 @@ impl Local {
             }
             let mut diff = crate::diff::lines(&one);
             if let Some(line) = self.line.and_then(|line| diff.get_mut(line)) {
-                line.style = line.style.add_modifier(Modifier::REVERSED);
+                line.style = line.style.patch(crate::theme::selected());
             }
             lines.extend(diff);
         }

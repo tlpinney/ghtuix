@@ -6,8 +6,8 @@ use crate::time;
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
-    style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    style::{Modifier, Style},
+    widgets::{Cell, Paragraph, Row, Table},
 };
 
 #[derive(Default)]
@@ -41,9 +41,7 @@ impl NotificationsView {
 
     pub fn draw(&self, frame: &mut Frame, area: Rect) -> Vec<(Rect, Action)> {
         let which = if self.all { "all" } else { "unread" };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Notifications · {which} "));
+        let block = crate::theme::pane(format!(" Notifications · {which} "));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let items = match &self.items {
@@ -72,11 +70,11 @@ impl NotificationsView {
                     style = style.add_modifier(Modifier::BOLD);
                 }
                 if index == self.selected {
-                    style = style.add_modifier(Modifier::REVERSED);
+                    style = style.patch(crate::theme::selected());
                 }
                 let mark = if item.unread { "●" } else { " " };
                 Row::new(vec![
-                    Cell::from(mark).style(Style::default().fg(Color::Blue)),
+                    Cell::from(mark).style(Style::default().fg(crate::theme::p().blue)),
                     Cell::from(item.repository.full_name.clone()),
                     Cell::from(kind(&item.subject.kind)),
                     Cell::from(item.subject.title.clone()),

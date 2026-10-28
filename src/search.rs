@@ -6,9 +6,9 @@ use crate::time;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Cell, Paragraph, Row, Table},
 };
 
 pub struct SearchView {
@@ -63,15 +63,12 @@ impl SearchView {
         let [input, results] =
             Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
         let style = if self.editing {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(crate::theme::p().yellow)
         } else {
             Style::default()
         };
         let cursor = if self.editing { "▏" } else { "" };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(style)
-            .title(" Search ");
+        let block = crate::theme::pane(" Search ").border_style(style);
         frame.render_widget(
             Paragraph::new(format!("{}{cursor}", self.query)).block(block),
             input,
@@ -83,7 +80,7 @@ impl SearchView {
             }
             _ => " Results ".into(),
         };
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = crate::theme::pane(title);
         let inner = block.inner(results);
         frame.render_widget(block, results);
         let found = match &self.results {
@@ -112,15 +109,15 @@ impl SearchView {
             .take(shown)
             .map(|(index, hit)| {
                 let style = if index == self.selected && !self.editing {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                    crate::theme::selected()
                 } else {
                     Style::default()
                 };
                 let colour = match hit.state.as_str() {
-                    "open" => Color::Green,
-                    "merged" => Color::Magenta,
-                    "closed" => Color::Red,
-                    _ => Color::DarkGray,
+                    "open" => crate::theme::p().green,
+                    "merged" => crate::theme::p().accent,
+                    "closed" => crate::theme::p().red,
+                    _ => crate::theme::p().overlay,
                 };
                 let kind = if hit.pr { "PR" } else { "Issue" };
                 Row::new(vec![

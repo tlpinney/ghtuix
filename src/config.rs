@@ -10,6 +10,8 @@ pub struct Config {
     pub host: Option<String>,
     /// Repositories (`owner/name`) never shown in the Inbox.
     pub excluded_repositories: Vec<String>,
+    /// The colour theme, such as `dracula` (`T` lists them all).
+    pub theme: Option<String>,
 }
 
 impl Config {
@@ -49,5 +51,7 @@ mod tests {
         assert_eq!(config.excluded_repositories, ["o/a"]);
         assert_eq!(config.host(), "github.com");
         assert!(toml::from_str::<Config>("colour = 1").is_err());
+        let config: Config = toml::from_str(r#"theme = "nord""#).unwrap();
+        assert_eq!(config.theme.as_deref(), Some("nord"));
     }
 }
