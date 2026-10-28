@@ -1,0 +1,52 @@
+# The Dashboard: one repository's PRs over a window, four aliased searches in one request.
+query Dashboard($opened: String!, $merged: String!, $open: String!, $waiting: String!) {
+  opened: search(query: $opened, type: ISSUE, first: 100) {
+    issueCount
+    nodes {
+      __typename
+      ... on PullRequest {
+        ...Rec
+      }
+    }
+  }
+  merged: search(query: $merged, type: ISSUE, first: 100) {
+    issueCount
+    nodes {
+      __typename
+      ... on PullRequest {
+        ...Rec
+      }
+    }
+  }
+  open: search(query: $open, type: ISSUE, first: 100) {
+    issueCount
+    nodes {
+      __typename
+      ... on PullRequest {
+        ...Rec
+      }
+    }
+  }
+  waiting: search(query: $waiting, type: ISSUE, first: 100) {
+    issueCount
+    nodes {
+      __typename
+      ... on PullRequest {
+        ...Rec
+      }
+    }
+  }
+}
+
+fragment Rec on PullRequest {
+  number
+  title
+  url
+  createdAt
+  mergedAt
+  isDraft
+  author {
+    __typename
+    login
+  }
+}

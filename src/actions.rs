@@ -280,6 +280,8 @@ pub(crate) mod tests {
             created_at: "2026-10-27T10:00:00Z".into(),
             html_url: format!("https://github.com/o/a/actions/runs/{id}"),
             actor: None,
+            run_started_at: Some("2026-10-27T10:00:00Z".into()),
+            updated_at: Some("2026-10-27T10:05:00Z".into()),
         }
     }
 

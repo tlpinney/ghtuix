@@ -2,8 +2,10 @@
 
 use crate::actions::{ActionsView, OpenRun};
 use crate::compose::{Compose, Stage, Target};
+use crate::dashboard::{DashboardView, Target as RecordTarget};
 use crate::git::{GraphLine, Repo};
 use crate::github::actions::{Job as RunJob, Run, Saved};
+use crate::github::dashboard::Metrics;
 use crate::github::notifications::Notification;
 use crate::github::search::Hit;
 use crate::inbox::{Inbox, Tab};
@@ -32,15 +34,17 @@ pub enum View {
     Actions,
     Notifications,
     Search,
+    Dashboard,
 }
 
 impl View {
-    const ALL: [(View, char, &'static str); 5] = [
+    const ALL: [(View, char, &'static str); 6] = [
         (View::Inbox, '1', "Inbox"),
         (View::Local, '2', "Local"),
         (View::Actions, '3', "Actions"),
         (View::Notifications, '4', "Notifications"),
         (View::Search, '5', "Search"),
+        (View::Dashboard, '6', "Dashboard"),
     ];
 }
 
@@ -82,6 +86,8 @@ pub enum Action {
     Merge,
     /// Pick the merge method in the merge preview.
     MergeMethod(MergeMethod),
+    /// Switch the Dashboard between 7 and 30 days.
+    DashboardDays(i64),
     /// Put the keys into the search query.
     SearchEdit,
     /// Run the typed search.
@@ -163,6 +169,11 @@ pub enum Message {
         query: String,
         result: Result<(Vec<Hit>, i64), String>,
     },
+    Dashboard {
+        repo: String,
+        days: i64,
+        result: Result<Box<Metrics>, String>,
+    },
     Notifications {
         all: bool,
         result: Result<(Vec<Notification>, Option<Saved>), String>,
@@ -205,6 +216,11 @@ pub enum Job {
     LoadPrTimeline {
         repo: String,
         number: i64,
+    },
+    /// A repository's PR and CI metrics over the last `days` days.
+    LoadDashboard {
+        repo: String,
+        days: i64,
     },
     /// Run a GitHub issue and pull request search.
     Search(String),
@@ -265,6 +281,7 @@ pub struct App {
     pr_from: View,
     pub notifications: NotificationsView,
     pub search: SearchView,
+    pub dashboard: DashboardView,
     /// A write being composed on the open PR.
     pub compose: Option<Compose>,
     /// A menu or a list of labels or reviewers to choose from.
@@ -295,6 +312,7 @@ impl Default for App {
             pr_from: View::Inbox,
             notifications: NotificationsView::default(),
             search: SearchView::default(),
+            dashboard: DashboardView::new(Err("No GitHub repository yet".into())),
             compose: None,
             picker: None,
             local: Local::new(Err("No checkout yet".into())),
@@ -346,6 +364,56 @@ impl App {
                 }
                 if view == View::Notifications && self.notifications.items.is_none() {
                     self.load_notifications();
+                }
+                if view == View::Dashboard && self.dashboard.metrics.is_none() {
+                    self.load_dashboard();
+                }
+            }
+            Action::DashboardDays(days) => {
+                if self.dashboard.days != days {
+                    self.dashboard.days = days;
+                    self.dashboard.metrics = None;
+                    self.dashboard.open = None;
+                    self.dashboard.loading = false;
+                    self.load_dashboard();
+                }
+            }
+            Action::Select(index) if self.view == View::Dashboard => {
+                if index == self.dashboard.current() {
+                    self.dispatch(Action::Open);
+                } else {
+                    self.dashboard.select(index);
+                }
+            }
+            Action::Move(delta) if self.view == View::Dashboard => {
+                self.dashboard.move_selection(delta)
+            }
+            Action::Open if self.view == View::Dashboard => match self.dashboard.open {
+                None => {
+                    if self.dashboard.selected < self.dashboard.cards().len() {
+                        self.dashboard.open = Some(self.dashboard.selected);
+                        self.dashboard.row = 0;
+                    }
+                }
+                Some(_) => match self.dashboard.selected_record().map(|r| r.target) {
+                    Some(RecordTarget::Pr {
+                        repo,
+                        number,
+                        title,
+                        url,
+                    }) => self.open_pr_from(repo, number, title, url),
+                    Some(RecordTarget::Web(url)) => self.jobs.push(Job::Open(url)),
+                    None => {}
+                },
+            },
+            Action::Back if self.view == View::Dashboard => self.dashboard.open = None,
+            Action::OpenInBrowser if self.view == View::Dashboard => {
+                let url = match self.dashboard.selected_record().map(|r| r.target) {
+                    Some(RecordTarget::Pr { url, .. } | RecordTarget::Web(url)) => Some(url),
+                    None => None,
+                };
+                if let Some(url) = url {
+                    self.jobs.push(Job::Open(url));
                 }
             }
             Action::SearchEdit => self.search.editing = true,
@@ -816,6 +884,8 @@ impl App {
                     self.load_actions();
                 } else if self.view == View::Notifications {
                     self.load_notifications();
+                } else if self.view == View::Dashboard {
+                    self.load_dashboard();
                 } else if self.view == View::Search {
                     // Only the last search runs again; half-typed text never does.
                     if let Some(query) = self.search.ran.clone()
@@ -1038,6 +1108,19 @@ impl App {
         self.pr = Some(PrView::new(summary));
         self.pr_from = self.view;
         self.view = View::Inbox;
+    }
+
+    /// Reads the Dashboard's numbers again, unless a read is running.
+    fn load_dashboard(&mut self) {
+        if let Ok(repo) = &self.dashboard.repo
+            && !self.dashboard.loading
+        {
+            self.dashboard.loading = true;
+            self.jobs.push(Job::LoadDashboard {
+                repo: repo.clone(),
+                days: self.dashboard.days,
+            });
+        }
     }
 
     /// Runs the typed query, unless it is empty or the same query is running.
@@ -1265,6 +1348,19 @@ impl App {
                 if let Some(compose) = &mut self.compose {
                     compose.stage = Stage::Preview;
                     compose.error = Some(error);
+                }
+            }
+            Message::Dashboard { repo, days, result } => {
+                if self.dashboard.repo.as_deref() == Ok(repo.as_str())
+                    && self.dashboard.days == days
+                {
+                    self.dashboard.loading = false;
+                    // A failed refresh keeps the numbers already shown.
+                    match (result, &self.dashboard.metrics) {
+                        (Err(error), Some(Ok(_))) => self.status = error,
+                        (result, _) => self.dashboard.metrics = Some(result.map(|m| *m)),
+                    }
+                    self.dashboard.move_selection(0);
                 }
             }
             Message::Search { query, result } => {
@@ -1546,6 +1642,31 @@ impl App {
                     .iter()
                     .map(|(tab, key, _)| Control::hidden(KeyCode::Char(*key), Action::Tab(*tab))),
             );
+        } else if self.view == View::Dashboard {
+            match self.dashboard.open {
+                Some(_) => {
+                    controls.push(Control::new(KeyCode::Enter, "Open", Action::Open));
+                    controls.push(Control::new(KeyCode::Char('b'), "Back", Action::Back));
+                    controls.push(Control::hidden(KeyCode::Left, Action::Back));
+                    controls.push(Control::hidden(KeyCode::Esc, Action::Back));
+                    controls.push(Control::new(
+                        KeyCode::Char('w'),
+                        "Web",
+                        Action::OpenInBrowser,
+                    ));
+                }
+                None => controls.push(Control::new(KeyCode::Enter, "Records", Action::Open)),
+            }
+            let (label, days) = if self.dashboard.days == 7 {
+                ("30 days", 30)
+            } else {
+                ("7 days", 7)
+            };
+            controls.push(Control::new(
+                KeyCode::Char('d'),
+                label,
+                Action::DashboardDays(days),
+            ));
         } else if self.view == View::Search && self.search.editing {
             // Keys type into the query; Esc leaves it. Clicks still reach every control.
             controls.push(Control::new(KeyCode::Enter, "Search", Action::RunSearch));
@@ -1670,6 +1791,7 @@ impl App {
             (View::Actions, None) => self.actions.draw(frame, body),
             (View::Notifications, None) => self.notifications.draw(frame, body),
             (View::Search, None) => self.search.draw(frame, body),
+            (View::Dashboard, None) => self.dashboard.draw(frame, body),
         };
         let note = self
             .api_note
@@ -2781,5 +2903,104 @@ mod tests {
             result: Ok((Vec::new(), 0)),
         });
         assert_eq!(app.search.selected_hit().unwrap().number, 3);
+    }
+
+    fn dashboard() -> App {
+        let mut app = signed_in();
+        app.dashboard = DashboardView::new(Ok("o/a".into()));
+        press(&mut app, KeyCode::Char('6'));
+        assert_eq!(
+            app.jobs,
+            vec![Job::LoadDashboard {
+                repo: "o/a".into(),
+                days: 7
+            }]
+        );
+        app.receive(Message::Dashboard {
+            repo: "o/a".into(),
+            days: 7,
+            result: Ok(Box::new(crate::dashboard::tests::metrics())),
+        });
+        app.jobs.clear();
+        app
+    }
+
+    #[test]
+    fn dashboard_cards_open_their_records_and_a_pr_returns_to_them() {
+        for by_click in [false, true] {
+            let mut app = dashboard();
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("o/a · last 7 days"), "{screen}");
+            assert!(screen.contains("PRs merged") && screen.contains("250 (list shows 100)"));
+            if by_click {
+                click(&mut app, &Action::Select(1));
+                draw(&mut app, 140);
+                click(&mut app, &Action::Select(1)); // the selected card opens
+            } else {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Enter);
+            }
+            assert_eq!(app.dashboard.open, Some(1));
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(
+                screen.contains("PR 3") && screen.contains("took 1d"),
+                "{screen}"
+            );
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(
+                &app.jobs[..],
+                [Job::LoadPr { repo, number: 2, .. }] if repo == "o/a"
+            ));
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view, View::Dashboard);
+            assert_eq!(app.dashboard.open, Some(1), "the card's records still show");
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.dashboard.open, None);
+        }
+    }
+
+    #[test]
+    fn a_failed_run_opens_on_the_web_and_d_switches_the_window() {
+        let mut app = dashboard();
+        app.dashboard.select(5); // Failed runs
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.jobs,
+            vec![Job::Open("https://github.com/o/a/actions/runs/2".into())]
+        );
+        app.jobs.clear();
+        draw(&mut app, 140);
+        click(&mut app, &Action::DashboardDays(30));
+        assert_eq!(
+            app.jobs,
+            vec![Job::LoadDashboard {
+                repo: "o/a".into(),
+                days: 30
+            }]
+        );
+        // A late answer for the old window is ignored.
+        app.receive(Message::Dashboard {
+            repo: "o/a".into(),
+            days: 7,
+            result: Ok(Box::new(crate::dashboard::tests::metrics())),
+        });
+        assert!(app.dashboard.metrics.is_none());
+        assert!(draw(&mut app, 140).join("\n").contains("last 30 days"));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.dashboard.days, 7);
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_numbers() {
+        let mut app = dashboard();
+        press(&mut app, KeyCode::Char('r'));
+        app.receive(Message::Dashboard {
+            repo: "o/a".into(),
+            days: 7,
+            result: Err("GitHub returned HTTP 502".into()),
+        });
+        assert!(matches!(app.dashboard.metrics, Some(Ok(_))));
+        assert_eq!(app.status, "GitHub returned HTTP 502");
     }
 }

@@ -27,6 +27,10 @@ pub struct Run {
     pub created_at: String,
     pub html_url: String,
     pub actor: Option<Login>,
+    #[serde(default)]
+    pub run_started_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 /// A job of a run, with its steps.

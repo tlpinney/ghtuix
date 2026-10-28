@@ -25,7 +25,7 @@ ghtuix
 Every control on screen is clickable and shows its key. Writes always show a preview of
 exactly what will happen and wait for **Enter** to confirm; **Esc** steps back.
 
-**Everywhere:** `1` Inbox, `2` Local, `3` Actions, `4` Notifications, `5` Search · `r` refresh · `q` quit ·
+**Everywhere:** `1` Inbox, `2` Local, `3` Actions, `4` Notifications, `5` Search, `6` Dashboard · `r` refresh · `q` quit ·
 `↑/↓` or `j/k` move · PgUp/PgDn and the wheel scroll.
 
 ### 1 Inbox
@@ -92,6 +92,21 @@ Type [GitHub search syntax](https://docs.github.com/search-github/searching-on-g
 | `Enter` / click a selected row | Open a PR in the PR view (Back returns here); an issue on the web |
 | `/` or click the query | Edit the search |
 | `w` | Open on GitHub |
+
+### 6 Dashboard
+
+PR and CI numbers for the checkout's repository over the last 7 or 30 days: PRs opened,
+merged (with the median time to merge), open, waiting for review, workflow runs (pass
+rate), failed runs and run time. Each card lists the records behind its number. When
+GitHub has more than the 100 newest records read, the card says the figure is partial;
+with nothing to measure it says so instead of showing zero. One GraphQL request and one
+Actions read.
+
+| Key | Action |
+| --- | --- |
+| `Enter` / click a selected card | List its records; `Enter` opens a PR in the PR view (Back returns here) or a run on the web |
+| `d` | Switch between 7 and 30 days |
+| `b`/`←`/`Esc` · `w` | Back to the cards · open the record on GitHub |
 
 ## Configuration
 

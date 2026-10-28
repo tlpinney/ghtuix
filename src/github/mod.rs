@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod actions;
 pub mod budget;
 pub mod choices;
+pub mod dashboard;
 pub mod history;
 pub mod inbox;
 pub mod notifications;

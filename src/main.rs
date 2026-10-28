@@ -3,6 +3,7 @@ mod app;
 mod cache;
 mod compose;
 mod config;
+mod dashboard;
 mod diff;
 mod editor;
 mod git;
@@ -62,6 +63,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
         }),
         Err(_) => Err("Not inside a Git checkout: start ghtuix in one to see its Actions".into()),
     });
+    app.dashboard = dashboard::DashboardView::new(app.actions.repo.clone());
     app.local = local::Local::new(
         checkout
             .map_err(|_| "Not inside a Git checkout: start ghtuix in one to see it here".into()),
@@ -309,6 +311,15 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 all,
                 result: client()
                     .and_then(|c| github::notifications::list(&c, all, saved).map_err(text)),
+            },
+            Job::LoadDashboard { repo, days } => Message::Dashboard {
+                result: client().and_then(|c| {
+                    github::dashboard::metrics(&c, &repo, days)
+                        .map(Box::new)
+                        .map_err(text)
+                }),
+                repo,
+                days,
             },
             Job::Search(query) => Message::Search {
                 result: client().and_then(|c| github::search::search(&c, &query).map_err(text)),

@@ -40,6 +40,11 @@ pub fn age_at_seconds(then: i64) -> String {
     duration(now() - then)
 }
 
+/// A span of seconds as `45s`, `12m`, `3h`, `5d`, …
+pub fn span(seconds: i64) -> String {
+    duration(seconds)
+}
+
 fn duration(seconds: i64) -> String {
     match seconds.max(0) {
         s if s < 60 => format!("{s}s"),
