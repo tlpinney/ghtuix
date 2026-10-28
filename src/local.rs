@@ -1,7 +1,7 @@
 //! The Local view: the current checkout's history, working changes and staged changes.
 
 use crate::app::Action;
-use crate::git::{GraphLine, Repo, Status};
+use crate::git::{Branch, GraphLine, Refs, Repo, Stash, Status};
 use crate::time;
 use ratatui::{
     Frame,
@@ -16,14 +16,23 @@ pub enum LocalTab {
     History,
     Working,
     Staged,
+    Branches,
+    Stash,
 }
 
 impl LocalTab {
-    pub const ALL: [(LocalTab, char, &'static str); 3] = [
+    pub const ALL: [(LocalTab, char, &'static str); 5] = [
         (LocalTab::History, 'g', "History"),
         (LocalTab::Working, 'w', "Working"),
         (LocalTab::Staged, 'i', "Staged"),
+        (LocalTab::Branches, 'B', "Branches"),
+        (LocalTab::Stash, 'S', "Stash"),
     ];
+
+    /// Working and Staged list changed files with their diffs.
+    pub fn has_files(self) -> bool {
+        matches!(self, LocalTab::Working | LocalTab::Staged)
+    }
 }
 
 /// The checkout's status and both diffs, read together.
@@ -55,6 +64,10 @@ pub struct Local {
     pub line: Option<usize>,
     /// A local write is running; another waits so it never applies to stale text.
     pub writing: bool,
+    pub refs: Option<Result<Refs, String>>,
+    /// The selected row of the Branches or Stash list.
+    pub branch: usize,
+    pub stash: usize,
 }
 
 impl Local {
@@ -71,6 +84,59 @@ impl Local {
             file: 0,
             line: None,
             writing: false,
+            refs: None,
+            branch: 0,
+            stash: 0,
+        }
+    }
+
+    pub fn branches(&self) -> &[Branch] {
+        match &self.refs {
+            Some(Ok(refs)) => &refs.branches,
+            _ => &[],
+        }
+    }
+
+    pub fn stashes(&self) -> &[Stash] {
+        match &self.refs {
+            Some(Ok(refs)) => &refs.stashes,
+            _ => &[],
+        }
+    }
+
+    /// Keeps both list selections inside lists that may have shrunk.
+    pub fn clamp_refs(&mut self) {
+        self.branch = self.branch.min(self.branches().len().saturating_sub(1));
+        self.stash = self.stash.min(self.stashes().len().saturating_sub(1));
+    }
+
+    /// A rebase that stopped and waits to be continued or aborted.
+    pub fn rebasing(&self) -> bool {
+        matches!(&self.refs, Some(Ok(refs)) if refs.operation.is_some())
+    }
+
+    pub fn selected_branch(&self) -> Option<&Branch> {
+        self.branches().get(self.branch)
+    }
+
+    pub fn selected_stash(&self) -> Option<&Stash> {
+        self.stashes().get(self.stash)
+    }
+
+    /// The selected row of the Branches or Stash list.
+    pub fn ref_row(&self) -> usize {
+        if self.tab == LocalTab::Stash {
+            self.stash
+        } else {
+            self.branch
+        }
+    }
+
+    pub fn select_ref(&mut self, index: usize) {
+        if self.tab == LocalTab::Stash {
+            self.stash = index.min(self.stashes().len().saturating_sub(1));
+        } else {
+            self.branch = index.min(self.branches().len().saturating_sub(1));
         }
     }
 
@@ -223,6 +289,10 @@ impl Local {
             hits.extend(self.draw_history(frame, inner));
             return hits;
         }
+        if matches!(self.tab, LocalTab::Branches | LocalTab::Stash) && self.commit.is_none() {
+            hits.extend(self.draw_refs(frame, inner));
+            return hits;
+        }
         let lines = self.lines();
         // Keep the diff cursor in sight.
         if let Some(line) = self.line {
@@ -289,6 +359,109 @@ impl Local {
                 ..area
             },
         );
+        hits
+    }
+
+    /// The Branches or Stash list, under a banner while a rebase waits.
+    fn draw_refs(&self, frame: &mut Frame, area: Rect) -> Vec<(Rect, Action)> {
+        let refs = match &self.refs {
+            Some(Ok(refs)) => refs,
+            Some(Err(error)) => {
+                frame.render_widget(Paragraph::new(error.clone()), area);
+                return Vec::new();
+            }
+            None => {
+                frame.render_widget(Paragraph::new("Loading…"), area);
+                return Vec::new();
+            }
+        };
+        let mut lines = Vec::new();
+        if refs.operation.is_some() {
+            lines.push(Line::styled(
+                "A rebase stopped. Fix the conflicts and stage them (w Working), then C Continue or X Abort.",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(""));
+        }
+        let top_row = lines.len();
+        let selected = self.ref_row();
+        let rows: Vec<Line> = if self.tab == LocalTab::Stash {
+            if refs.stashes.is_empty() {
+                vec![Line::raw("No stashes (Z stashes your changes)")]
+            } else {
+                refs.stashes
+                    .iter()
+                    .map(|stash| {
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{:<11}", stash.name),
+                                Style::default().fg(Color::Magenta),
+                            ),
+                            Span::styled(
+                                format!("{:>4}  ", time::age(&stash.date)),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ),
+                            Span::raw(stash.message.clone()),
+                        ])
+                    })
+                    .collect()
+            }
+        } else {
+            refs.branches
+                .iter()
+                .map(|branch| {
+                    let mark = if branch.current { "* " } else { "  " };
+                    let mut spans = vec![Span::styled(
+                        format!("{mark}{}", branch.name),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(if branch.current {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    )];
+                    if let Some(upstream) = &branch.upstream {
+                        let track = if branch.track.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", branch.track)
+                        };
+                        spans.push(Span::styled(
+                            format!(" → {upstream}{track}"),
+                            Style::default().fg(Color::Cyan),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        format!("  {} ", time::age(&branch.date)),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                    spans.push(Span::raw(branch.subject.clone()));
+                    Line::from(spans)
+                })
+                .collect()
+        };
+        let count = if self.tab == LocalTab::Stash {
+            refs.stashes.len()
+        } else {
+            refs.branches.len()
+        };
+        let room = usize::from(area.height).saturating_sub(top_row);
+        let top = selected.saturating_sub(room.saturating_sub(1));
+        let mut hits = Vec::new();
+        for (index, line) in rows.into_iter().enumerate().skip(top).take(room) {
+            let line = if index == selected && count > 0 {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            };
+            if count > 0 {
+                let y = area.y + (top_row + index - top) as u16;
+                hits.push((Rect::new(area.x, y, area.width, 1), Action::Select(index)));
+            }
+            lines.push(line);
+        }
+        frame.render_widget(Paragraph::new(lines), area);
         hits
     }
 

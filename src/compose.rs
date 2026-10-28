@@ -119,6 +119,9 @@ impl Compose {
             WriteKind::Commit { branch, files, .. } => {
                 format!("Commit {} staged file(s) on {branch} in", files.len())
             }
+            WriteKind::Local { op } => {
+                format!("{} in", WriteKind::Local { op: op.clone() }.label())
+            }
             WriteKind::MarkRead { .. } => "Mark read the notification in".into(),
             WriteKind::MarkDone { .. } => "Mark done (leaves the inbox) the notification in".into(),
             WriteKind::Close => "Close".into(),
@@ -138,7 +141,39 @@ impl Compose {
             Line::raw(self.target.title.clone()),
             Line::raw(format!("As @{login}")),
         ];
-        if let WriteKind::Commit { author, files, .. } = &self.kind {
+        if let WriteKind::Local { op } = &self.kind {
+            use crate::git::LocalOp;
+            // A local operation: the exact git command, and what it will do.
+            lines[2] = Line::raw(format!("Runs: {}", op.command(&self.editor.text())));
+            let note = match op {
+                LocalOp::Switch(_) => {
+                    "Uncommitted changes come along; git refuses if they would be overwritten."
+                }
+                LocalOp::CreateBranch => "The new branch starts at the current commit.",
+                LocalOp::DeleteBranch(_) => "Only a fully merged branch; git refuses otherwise.",
+                LocalOp::Rebase { .. } => "",
+                LocalOp::RebaseContinue => "Uses the commit messages as they are.",
+                LocalOp::RebaseAbort => "Returns the branch to where it was before the rebase.",
+                LocalOp::StashPush => "Tracked and untracked changes are saved and removed.",
+                LocalOp::StashApply(_) => "The stash stays in the list.",
+                LocalOp::StashPop(_) => "The stash is removed once it applies cleanly.",
+                LocalOp::StashDrop(_) => "The stash is deleted.",
+            };
+            if !note.is_empty() {
+                lines.push(Line::raw(note));
+            }
+            if let LocalOp::Rebase { onto, plan } = op {
+                lines.push(Line::raw(format!(
+                    "Replays {} commit(s) onto {onto}, which has {} commit(s) this branch lacks:",
+                    plan.replay.len(),
+                    plan.incoming
+                )));
+                lines.extend(plan.replay.iter().map(|c| Line::raw(format!("  {c}"))));
+                lines.push(Line::raw(
+                    "If it stops on a conflict, Branches offers Continue and Abort.",
+                ));
+            }
+        } else if let WriteKind::Commit { author, files, .. } = &self.kind {
             // A local commit: git's own author identity, not the GitHub account.
             lines[2] = Line::raw(format!("As {author}"));
             for file in files {
@@ -190,7 +225,15 @@ impl Compose {
             lines.extend(text.lines().map(|line| Line::raw(format!("│ {line}"))));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::raw("Nothing is sent until you confirm."));
+        let local = matches!(
+            self.kind,
+            WriteKind::Commit { .. } | WriteKind::Local { .. }
+        );
+        lines.push(Line::raw(if local {
+            "Nothing runs until you confirm."
+        } else {
+            "Nothing is sent until you confirm."
+        }));
         lines
     }
 

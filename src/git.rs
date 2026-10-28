@@ -38,6 +38,83 @@ pub struct Status {
     pub unstaged: Vec<(String, char)>,
 }
 
+/// A local branch, as `git for-each-ref refs/heads` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    pub current: bool,
+    pub upstream: Option<String>,
+    /// `ahead 1, behind 2`, `gone`, or empty.
+    pub track: String,
+    pub date: String,
+    pub subject: String,
+}
+
+/// A stash entry: `stash@{0}`, when it was made and its message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stash {
+    pub name: String,
+    pub date: String,
+    pub message: String,
+}
+
+/// Branches, stashes and an operation left in progress (a rebase that stopped).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Refs {
+    pub branches: Vec<Branch>,
+    pub stashes: Vec<Stash>,
+    /// `rebase` while a rebase waits to be continued or aborted.
+    pub operation: Option<String>,
+}
+
+/// What a rebase onto a branch would do: the commits it replays and those it brings in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebasePlan {
+    pub replay: Vec<String>,
+    pub incoming: usize,
+}
+
+/// A local operation on branches, stashes or a rebase. Each runs only after its preview
+/// is confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalOp {
+    Switch(String),
+    /// Create a branch at HEAD and switch to it; the name is the compose box's text.
+    CreateBranch,
+    DeleteBranch(String),
+    Rebase {
+        onto: String,
+        plan: RebasePlan,
+    },
+    RebaseContinue,
+    RebaseAbort,
+    /// Stash every change, untracked files too; the message is the compose box's text.
+    StashPush,
+    StashApply(String),
+    StashPop(String),
+    StashDrop(String),
+}
+
+impl LocalOp {
+    /// The git command line the preview shows (`text` is the compose box's text).
+    pub fn command(&self, text: &str) -> String {
+        let text = text.trim();
+        match self {
+            Self::Switch(branch) => format!("git switch {branch}"),
+            Self::CreateBranch => format!("git switch -c {text}"),
+            Self::DeleteBranch(branch) => format!("git branch -d {branch}"),
+            Self::Rebase { onto, .. } => format!("git rebase {onto}"),
+            Self::RebaseContinue => "git rebase --continue".into(),
+            Self::RebaseAbort => "git rebase --abort".into(),
+            Self::StashPush if text.is_empty() => "git stash push --include-untracked".into(),
+            Self::StashPush => format!("git stash push --include-untracked -m \"{text}\""),
+            Self::StashApply(stash) => format!("git stash apply {stash}"),
+            Self::StashPop(stash) => format!("git stash pop {stash}"),
+            Self::StashDrop(stash) => format!("git stash drop {stash}"),
+        }
+    }
+}
+
 /// A checkout, found from a directory inside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repo {
@@ -131,6 +208,132 @@ impl Repo {
         }
     }
 
+    /// Local branches, stashes and any rebase left in progress.
+    pub fn refs(&self) -> Result<Refs> {
+        let format = [
+            "%(HEAD)",
+            "%(refname:short)",
+            "%(upstream:short)",
+            "%(upstream:track,nobracket)",
+            "%(committerdate:iso-strict)",
+            "%(subject)",
+        ]
+        .join("%1f");
+        let out = self.git(&[
+            "for-each-ref",
+            &format!("--format={format}"),
+            "--sort=-committerdate",
+            "refs/heads",
+        ])?;
+        let branches = out
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split(FIELD);
+                let mut next = || fields.next().unwrap_or_default().to_owned();
+                let (head, name, upstream) = (next(), next(), next());
+                Some(Branch {
+                    current: head == "*",
+                    name: Some(name).filter(|n| !n.is_empty())?,
+                    upstream: Some(upstream).filter(|u| !u.is_empty()),
+                    track: next(),
+                    date: next(),
+                    subject: next(),
+                })
+            })
+            .collect();
+        let out = self.git(&["stash", "list", "--format=%gd%x1f%cI%x1f%gs"])?;
+        let stashes = out
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split(FIELD);
+                Some(Stash {
+                    name: fields.next()?.to_owned(),
+                    date: fields.next().unwrap_or_default().to_owned(),
+                    message: fields.next().unwrap_or_default().to_owned(),
+                })
+            })
+            .collect();
+        let rebasing = ["rebase-merge", "rebase-apply"].iter().any(|dir| {
+            self.git(&["rev-parse", "--git-path", dir])
+                .is_ok_and(|path| self.root.join(path.trim_end()).exists())
+        });
+        Ok(Refs {
+            branches,
+            stashes,
+            operation: rebasing.then(|| "rebase".to_owned()),
+        })
+    }
+
+    /// The patch a stash holds (tracked changes; untracked files are listed by name).
+    pub fn stash_show(&self, stash: &str) -> Result<String> {
+        check_ref(stash)?;
+        self.git(&["stash", "show", "-p", "--include-untracked", stash])
+            .or_else(|_| self.git(&["stash", "show", "-p", stash]))
+    }
+
+    /// What rebasing the current branch onto `onto` would replay and bring in.
+    pub fn rebase_plan(&self, onto: &str) -> Result<RebasePlan> {
+        check_ref(onto)?;
+        let replay = self.git(&[
+            "log",
+            "--format=%h %s",
+            "--reverse",
+            &format!("{onto}..HEAD"),
+        ])?;
+        let incoming = self.git(&["rev-list", "--count", &format!("HEAD..{onto}")])?;
+        Ok(RebasePlan {
+            replay: replay.lines().map(str::to_owned).collect(),
+            incoming: incoming.trim().parse().unwrap_or(0),
+        })
+    }
+
+    /// Runs a confirmed local operation; returns git's own report of what it did.
+    pub fn local_op(&self, op: &LocalOp, text: &str) -> Result<String> {
+        let text = text.trim();
+        let out = match op {
+            LocalOp::Switch(branch) => {
+                check_ref(branch)?;
+                write(&self.root, &["switch", branch], None)?
+            }
+            LocalOp::CreateBranch => {
+                check_ref(text)?;
+                self.git(&["check-ref-format", "--branch", text])
+                    .map_err(|_| anyhow::anyhow!("“{text}” is not a valid branch name"))?;
+                write(&self.root, &["switch", "-c", text], None)?
+            }
+            LocalOp::DeleteBranch(branch) => {
+                check_ref(branch)?;
+                write(&self.root, &["branch", "-d", branch], None)?
+            }
+            LocalOp::Rebase { onto, .. } => {
+                check_ref(onto)?;
+                write(&self.root, &["rebase", onto], None)?
+            }
+            LocalOp::RebaseContinue => write(&self.root, &["rebase", "--continue"], None)?,
+            LocalOp::RebaseAbort => write(&self.root, &["rebase", "--abort"], None)?,
+            LocalOp::StashPush => {
+                // A pathspec is needed: under --literal-pathspecs git otherwise saves
+                // untracked files without removing them.
+                let mut args = vec!["stash", "push", "--include-untracked"];
+                if !text.is_empty() {
+                    args.extend(["-m", text]);
+                }
+                args.extend(["--", "."]);
+                write(&self.root, &args, None)?
+            }
+            LocalOp::StashApply(stash) | LocalOp::StashPop(stash) | LocalOp::StashDrop(stash) => {
+                check_ref(stash)?;
+                let verb = match op {
+                    LocalOp::StashApply(_) => "apply",
+                    LocalOp::StashPop(_) => "pop",
+                    _ => "drop",
+                };
+                write(&self.root, &["stash", verb, stash], None)?
+            }
+        };
+        Ok(out.trim().to_owned())
+    }
+
     /// Applies `patch` to the index only (the working tree is untouched); `reverse` takes
     /// it out again. Git refuses a patch that no longer fits, as when the file changed.
     pub fn apply_cached(&self, patch: &str, reverse: bool) -> Result<()> {
@@ -157,6 +360,14 @@ impl Repo {
     pub fn staged_diff(&self) -> Result<String> {
         self.git(&["diff", "--no-ext-diff", "--cached"])
     }
+}
+
+/// Refuses a name git would read as an option (or an empty one).
+fn check_ref(name: &str) -> Result<()> {
+    if name.is_empty() || name.starts_with('-') {
+        bail!("“{name}” is not a branch or stash name");
+    }
+    Ok(())
 }
 
 /// Runs a read-only git command in `dir` and returns its output.
@@ -208,7 +419,8 @@ fn write(dir: &Path, args: &[&str], stdin: Option<&str>) -> Result<String> {
         .args(["--no-pager", "--literal-pathspecs", "-c", "color.ui=never"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_EDITOR")
+        // No editor may start (rebase --continue would open one): keep messages as they are.
+        .env("GIT_EDITOR", "true")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -462,6 +674,88 @@ mod tests {
             !staged.contains("line two") && staged.contains("+line eighteen"),
             "{staged}"
         );
+    }
+
+    #[test]
+    fn branches_stash_and_rebase_run_through_git() {
+        let (repo, dir) = repo();
+        let op = |op: LocalOp, text: &str| repo.local_op(&op, text);
+        let refs = repo.refs().unwrap();
+        assert_eq!(refs.branches.len(), 1);
+        assert!(refs.branches[0].current && refs.branches[0].name == "main");
+        assert_eq!(refs.operation, None);
+        // Stash everything, untracked files too, and get it back.
+        op(LocalOp::StashPush, "wip").unwrap();
+        assert!(
+            !dir.join("new.txt").exists(),
+            "the untracked file was stashed away"
+        );
+        let refs = repo.refs().unwrap();
+        assert_eq!(refs.stashes[0].name, "stash@{0}");
+        assert!(refs.stashes[0].message.contains("wip"));
+        assert!(repo.stash_show("stash@{0}").unwrap().contains("+three"));
+        assert!(repo.status().unwrap().unstaged.is_empty());
+        op(LocalOp::StashPop("stash@{0}".into()), "").unwrap();
+        assert!(dir.join("new.txt").exists());
+        assert!(repo.refs().unwrap().stashes.is_empty());
+        repo.stage("a.txt").unwrap();
+        repo.stage("new.txt").unwrap();
+        repo.commit("Second").unwrap();
+        // Branch names are checked before git sees them.
+        assert!(op(LocalOp::CreateBranch, "-x").is_err());
+        assert!(op(LocalOp::CreateBranch, "a..b").is_err());
+        op(LocalOp::CreateBranch, "feature").unwrap();
+        std::fs::write(dir.join("f.txt"), "feature\n").unwrap();
+        repo.stage("f.txt").unwrap();
+        repo.commit("Feature work").unwrap();
+        op(LocalOp::Switch("main".into()), "").unwrap();
+        std::fs::write(dir.join("m.txt"), "main\n").unwrap();
+        repo.stage("m.txt").unwrap();
+        repo.commit("Main work").unwrap();
+        // An unmerged branch is not deleted by -d.
+        assert!(op(LocalOp::DeleteBranch("feature".into()), "").is_err());
+        op(LocalOp::Switch("feature".into()), "").unwrap();
+        let plan = repo.rebase_plan("main").unwrap();
+        assert_eq!(plan.incoming, 1);
+        assert_eq!(plan.replay.len(), 1);
+        assert!(plan.replay[0].ends_with("Feature work"));
+        op(
+            LocalOp::Rebase {
+                onto: "main".into(),
+                plan,
+            },
+            "",
+        )
+        .unwrap();
+        assert!(dir.join("m.txt").exists() && dir.join("f.txt").exists());
+        // A conflicting rebase stops, shows as in progress, and aborts cleanly.
+        std::fs::write(dir.join("a.txt"), "feature side\n").unwrap();
+        repo.stage("a.txt").unwrap();
+        repo.commit("Feature edit").unwrap();
+        op(LocalOp::Switch("main".into()), "").unwrap();
+        std::fs::write(dir.join("a.txt"), "main side\n").unwrap();
+        repo.stage("a.txt").unwrap();
+        repo.commit("Main edit").unwrap();
+        op(LocalOp::Switch("feature".into()), "").unwrap();
+        let plan = repo.rebase_plan("main").unwrap();
+        assert!(
+            op(
+                LocalOp::Rebase {
+                    onto: "main".into(),
+                    plan
+                },
+                ""
+            )
+            .is_err()
+        );
+        assert_eq!(repo.refs().unwrap().operation.as_deref(), Some("rebase"));
+        op(LocalOp::RebaseAbort, "").unwrap();
+        assert_eq!(repo.refs().unwrap().operation, None);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "feature side\n"
+        );
+        assert!(repo.rebase_plan("--output=x").is_err());
     }
 
     #[test]

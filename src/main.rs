@@ -379,7 +379,8 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 run_id,
             },
             Job::GitWrite(repo, op) => {
-                let commit = matches!(op, app::GitOp::Commit(_));
+                // Commits and branch, stash or rebase operations come from a preview.
+                let composed = matches!(op, app::GitOp::Commit(_) | app::GitOp::Local(..));
                 let result = match op {
                     app::GitOp::Stage(path) => repo.stage(&path).map(|()| String::new()),
                     app::GitOp::Unstage(path) => repo.unstage(&path).map(|()| String::new()),
@@ -387,13 +388,23 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                     app::GitOp::Apply { patch, reverse } => {
                         repo.apply_cached(&patch, reverse).map(|()| String::new())
                     }
+                    app::GitOp::Local(op, text) => repo.local_op(&op, &text),
                 };
                 Message::GitDone {
-                    commit,
+                    composed,
                     result: result.map_err(text),
                 }
             }
             Job::LoadHistory(repo) => Message::History(repo.history(500).map_err(text)),
+            Job::LoadRefs(repo) => Message::Refs(repo.refs().map_err(text)),
+            Job::ShowStash(repo, name) => Message::Commit {
+                result: repo.stash_show(&name).map_err(text),
+                sha: name,
+            },
+            Job::PlanRebase(repo, onto) => Message::RebasePlan {
+                result: repo.rebase_plan(&onto).map_err(text),
+                onto,
+            },
             Job::LoadChanges(repo) => Message::Changes(
                 repo.status()
                     .and_then(|status| {

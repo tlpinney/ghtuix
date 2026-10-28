@@ -3,7 +3,7 @@
 use crate::actions::{ActionsView, OpenRun};
 use crate::compose::{Compose, Stage, Target};
 use crate::dashboard::{DashboardView, Target as RecordTarget};
-use crate::git::{GraphLine, Repo};
+use crate::git::{GraphLine, LocalOp, RebasePlan, Refs, Repo};
 use crate::github::actions::{Job as RunJob, Run, Saved};
 use crate::github::dashboard::Metrics;
 use crate::github::notifications::Notification;
@@ -82,6 +82,8 @@ pub enum Action {
     DiffLine(usize),
     /// Stage (Working) or unstage (Staged) the one line under the diff cursor.
     StageLine,
+    /// Preview a branch, stash or rebase operation on the selected row.
+    LocalOp(LocalChoice),
     /// Re-run the failed jobs of the open workflow run.
     Rerun,
     /// Cancel the open workflow run.
@@ -162,9 +164,16 @@ pub enum Message {
         finished: bool,
         result: Result<String, String>,
     },
-    /// A local git write finished; for a commit, the new commit's id.
+    Refs(Result<Refs, String>),
+    /// What a rebase onto `onto` would do, read for its preview.
+    RebasePlan {
+        onto: String,
+        result: Result<RebasePlan, String>,
+    },
+    /// A local git write finished; for a commit, the new commit's id. `composed` writes
+    /// came from a preview, which closes on success.
     GitDone {
-        commit: bool,
+        composed: bool,
         result: Result<String, String>,
     },
     /// A write finished: the new comment's or review's URL, or why it failed.
@@ -257,6 +266,9 @@ pub enum Job {
     /// Change the local checkout: stage, unstage or commit.
     GitWrite(Repo, GitOp),
     LoadHistory(Repo),
+    LoadRefs(Repo),
+    ShowStash(Repo, String),
+    PlanRebase(Repo, String),
     LoadChanges(Repo),
     ShowCommit(Repo, String),
     Write {
@@ -266,6 +278,21 @@ pub enum Job {
         body: String,
     },
     Open(String),
+}
+
+/// A branch, stash or rebase operation as a control names it, before its preview.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalChoice {
+    Switch,
+    NewBranch,
+    DeleteBranch,
+    Rebase,
+    Continue,
+    Abort,
+    StashPush,
+    StashApply,
+    StashPop,
+    StashDrop,
 }
 
 /// A local git write.
@@ -279,6 +306,8 @@ pub enum GitOp {
         reverse: bool,
     },
     Commit(String),
+    /// A confirmed branch, stash or rebase operation, with the compose box's text.
+    Local(LocalOp, String),
 }
 
 pub struct App {
@@ -522,12 +551,44 @@ impl App {
                 self.local.line = None;
             }
             Action::Select(index)
-                if self.view == View::Local && self.local.tab != LocalTab::History =>
+                if self.view == View::Local
+                    && matches!(self.local.tab, LocalTab::Branches | LocalTab::Stash)
+                    && self.local.commit.is_none() =>
             {
+                if index == self.local.ref_row() {
+                    self.dispatch(Action::Open);
+                } else {
+                    self.local.select_ref(index);
+                }
+            }
+            Action::Move(delta)
+                if self.view == View::Local
+                    && matches!(self.local.tab, LocalTab::Branches | LocalTab::Stash) =>
+            {
+                if self.local.commit.is_some() {
+                    self.local.scroll_by(delta);
+                } else {
+                    self.local
+                        .select_ref(self.local.ref_row().saturating_add_signed(delta));
+                }
+            }
+            Action::Open if self.view == View::Local && self.local.tab == LocalTab::Branches => {
+                self.dispatch(Action::LocalOp(LocalChoice::Switch));
+            }
+            Action::Open if self.view == View::Local && self.local.tab == LocalTab::Stash => {
+                if let (Ok(repo), Some(stash)) = (&self.local.repo, self.local.selected_stash()) {
+                    let name = stash.name.clone();
+                    self.jobs.push(Job::ShowStash(repo.clone(), name.clone()));
+                    self.local.commit = Some((name, None));
+                    self.local.scroll = 0;
+                }
+            }
+            Action::LocalOp(choice) => self.local_op(choice),
+            Action::Select(index) if self.view == View::Local && self.local.tab.has_files() => {
                 self.local.select_file(index);
             }
             Action::DiffLine(index) => self.local.place_line(index),
-            Action::Open if self.view == View::Local && self.local.tab != LocalTab::History => {
+            Action::Open if self.view == View::Local && self.local.tab.has_files() => {
                 if !self.local.enter_diff() {
                     self.status = "This file has no text hunks; + stages it whole".into();
                 }
@@ -535,9 +596,7 @@ impl App {
             Action::Back if self.view == View::Local && self.local.line.is_some() => {
                 self.local.line = None;
             }
-            Action::Move(delta)
-                if self.view == View::Local && self.local.tab != LocalTab::History =>
-            {
+            Action::Move(delta) if self.view == View::Local && self.local.tab.has_files() => {
                 // Arrows move between files, or between changes once the cursor is in the
                 // diff; paging and the wheel scroll.
                 if delta.abs() == 1 && self.local.line.is_some() {
@@ -883,6 +942,13 @@ impl App {
                         }
                         return;
                     }
+                    if let WriteKind::Local { op } = &compose.kind {
+                        if let Ok(repo) = &self.local.repo {
+                            let op = GitOp::Local(op.clone(), compose.editor.text());
+                            self.jobs.push(Job::GitWrite(repo.clone(), op));
+                        }
+                        return;
+                    }
                     self.jobs.push(Job::Write {
                         kind: compose.kind.clone(),
                         pr_id: compose.target.pr_id.clone(),
@@ -1128,6 +1194,75 @@ impl App {
         }
     }
 
+    /// Opens the preview of a branch, stash or rebase operation on the selected row, or
+    /// says why it does not apply.
+    fn local_op(&mut self, choice: LocalChoice) {
+        let Ok(repo) = self.local.repo.clone() else {
+            return;
+        };
+        let branch = self.local.selected_branch().cloned();
+        let stash = self.local.selected_stash().map(|s| s.name.clone());
+        let rebasing = self.local.rebasing();
+        let op = match choice {
+            LocalChoice::Continue | LocalChoice::Abort if !rebasing => {
+                self.status = "No rebase is in progress".into();
+                return;
+            }
+            LocalChoice::Continue => LocalOp::RebaseContinue,
+            LocalChoice::Abort => LocalOp::RebaseAbort,
+            _ if rebasing && choice != LocalChoice::StashPush => {
+                self.status = "Finish the rebase first: C Continue or X Abort".into();
+                return;
+            }
+            LocalChoice::NewBranch => LocalOp::CreateBranch,
+            LocalChoice::StashPush => LocalOp::StashPush,
+            LocalChoice::Switch | LocalChoice::DeleteBranch | LocalChoice::Rebase => {
+                let Some(branch) = branch else { return };
+                if branch.current {
+                    self.status = format!("{} is the current branch", branch.name);
+                    return;
+                }
+                match choice {
+                    LocalChoice::Switch => LocalOp::Switch(branch.name),
+                    LocalChoice::DeleteBranch => LocalOp::DeleteBranch(branch.name),
+                    // The preview needs the commits it would replay: read them first.
+                    _ => {
+                        self.jobs.push(Job::PlanRebase(repo, branch.name));
+                        return;
+                    }
+                }
+            }
+            LocalChoice::StashApply | LocalChoice::StashPop | LocalChoice::StashDrop => {
+                let Some(stash) = stash else {
+                    self.status = "There is no stash".into();
+                    return;
+                };
+                match choice {
+                    LocalChoice::StashApply => LocalOp::StashApply(stash),
+                    LocalChoice::StashPop => LocalOp::StashPop(stash),
+                    _ => LocalOp::StashDrop(stash),
+                }
+            }
+        };
+        self.compose_local(op);
+    }
+
+    fn compose_local(&mut self, op: LocalOp) {
+        let root = self
+            .local
+            .repo
+            .as_ref()
+            .map_or(String::new(), |repo| repo.root.display().to_string());
+        let branch = match &self.local.changes {
+            Some(Ok(changes)) => format!("on {}", changes.status.branch),
+            _ => String::new(),
+        };
+        self.compose = Some(Compose::new(
+            WriteKind::Local { op },
+            Target::run(&root, &branch),
+        ));
+    }
+
     /// Opens PR `repo#number` in the PR view; Back returns to the current view.
     fn open_pr_from(&mut self, repo: String, number: i64, title: String, url: String) {
         let summary = PullRequest {
@@ -1209,6 +1344,7 @@ impl App {
             self.local.loading = true;
             self.jobs.push(Job::LoadHistory(repo.clone()));
             self.jobs.push(Job::LoadChanges(repo.clone()));
+            self.jobs.push(Job::LoadRefs(repo.clone()));
         }
     }
 
@@ -1315,6 +1451,17 @@ impl App {
                 self.local.history = Some(result);
                 self.local.move_selection(0);
             }
+            Message::Refs(result) => {
+                self.local.refs = Some(result);
+                self.local.clamp_refs();
+            }
+            Message::RebasePlan { onto, result } => match result {
+                Ok(plan) if plan.replay.is_empty() && plan.incoming == 0 => {
+                    self.status = format!("Already up to date with {onto}; nothing to rebase");
+                }
+                Ok(plan) => self.compose_local(LocalOp::Rebase { onto, plan }),
+                Err(error) => self.status = error,
+            },
             Message::Changes(result) => {
                 self.local.changes = Some(result);
                 self.local.settle_line();
@@ -1347,11 +1494,41 @@ impl App {
                     log.load(result);
                 }
             }
-            Message::GitDone { commit, result } => {
-                match (&result, commit) {
+            Message::GitDone { composed, result } => {
+                let local = self
+                    .compose
+                    .as_ref()
+                    .is_some_and(|c| matches!(c.kind, WriteKind::Local { .. }));
+                match (&result, composed) {
+                    (Ok(out), true) if local => {
+                        let label = self
+                            .compose
+                            .take()
+                            .map(|c| c.kind.label())
+                            .unwrap_or_default();
+                        let said = out.lines().last().unwrap_or("done");
+                        self.status = format!("{label}: {said}");
+                    }
                     (Ok(sha), true) => {
                         self.compose = None;
                         self.status = format!("Committed {}", &sha[..sha.len().min(8)]);
+                    }
+                    // A failed branch, stash or rebase operation may still have changed
+                    // the checkout (a rebase stops on a conflict): close, say why, reload.
+                    (Err(error), true) if local => {
+                        let stopped = self.compose.take().is_some_and(|c| {
+                            matches!(
+                                c.kind,
+                                WriteKind::Local {
+                                    op: LocalOp::Rebase { .. } | LocalOp::RebaseContinue
+                                }
+                            )
+                        });
+                        self.status = if stopped {
+                            format!("{error} • B Branches: C Continue or X Abort")
+                        } else {
+                            error.clone()
+                        };
                     }
                     (Err(error), true) => {
                         if let Some(compose) = &mut self.compose {
@@ -1790,6 +1967,27 @@ impl App {
                 controls.push(Control::hidden(KeyCode::Esc, Action::Back));
             } else if self.local.tab == LocalTab::History {
                 controls.push(Control::new(KeyCode::Enter, "Show commit", Action::Open));
+            } else if self.local.tab == LocalTab::Branches {
+                let op = |key, label, choice| {
+                    Control::new(KeyCode::Char(key), label, Action::LocalOp(choice))
+                };
+                if self.local.rebasing() {
+                    controls.push(op('C', "Continue rebase", LocalChoice::Continue));
+                    controls.push(op('X', "Abort rebase", LocalChoice::Abort));
+                }
+                controls.push(Control::new(KeyCode::Enter, "Switch", Action::Open));
+                controls.push(op('N', "New branch", LocalChoice::NewBranch));
+                controls.push(op('R', "Rebase onto", LocalChoice::Rebase));
+                controls.push(op('D', "Delete", LocalChoice::DeleteBranch));
+            } else if self.local.tab == LocalTab::Stash {
+                let op = |key, label, choice| {
+                    Control::new(KeyCode::Char(key), label, Action::LocalOp(choice))
+                };
+                controls.push(op('Z', "Stash changes", LocalChoice::StashPush));
+                controls.push(Control::new(KeyCode::Enter, "Show", Action::Open));
+                controls.push(op('A', "Apply", LocalChoice::StashApply));
+                controls.push(op('P', "Pop", LocalChoice::StashPop));
+                controls.push(op('X', "Drop", LocalChoice::StashDrop));
             } else if self.local.line.is_some() {
                 if self.local.tab == LocalTab::Working {
                     controls.push(Control::new(
@@ -2436,12 +2634,12 @@ mod tests {
             );
             app.jobs.clear();
             app.receive(Message::GitDone {
-                commit: true,
+                composed: true,
                 result: Ok("0123456789abcdef".into()),
             });
             assert!(app.compose.is_none());
             assert_eq!(app.status, "Committed 01234567");
-            assert_eq!(app.jobs.len(), 2, "history and changes reload");
+            assert_eq!(app.jobs.len(), 3, "history, changes and refs reload");
         }
     }
 
@@ -2521,7 +2719,7 @@ mod tests {
                 ..App::default()
             };
             press(&mut app, KeyCode::Char('2'));
-            assert_eq!(app.jobs.len(), 2, "history and changes load together");
+            assert_eq!(app.jobs.len(), 3, "history, changes and refs load together");
             app.jobs.clear();
             app.receive(Message::History(Ok(crate::local::tests::history())));
             let screen = draw(&mut app, 120).join("\n");
@@ -3180,7 +3378,7 @@ mod tests {
             assert!(app.jobs.is_empty());
             assert_eq!(app.status, "Wait for the last change to finish");
             app.receive(Message::GitDone {
-                commit: false,
+                composed: false,
                 result: Ok(String::new()),
             });
             assert!(!app.local.writing);
@@ -3230,5 +3428,218 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.local.line, None);
         assert_eq!(app.view, View::Local);
+    }
+
+    fn with_refs(operation: Option<&str>) -> App {
+        use crate::git::{Branch, Stash};
+        let mut app = App {
+            local: Local::new(Ok(Repo {
+                root: "/tmp/repo".into(),
+            })),
+            jobs: Vec::new(),
+            ..App::default()
+        };
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('B'));
+        let branch = |name: &str, current| Branch {
+            name: name.into(),
+            current,
+            upstream: None,
+            track: String::new(),
+            date: "2026-10-27T10:00:00Z".into(),
+            subject: format!("tip of {name}"),
+        };
+        app.receive(Message::Refs(Ok(Refs {
+            branches: vec![branch("main", true), branch("feature", false)],
+            stashes: vec![Stash {
+                name: "stash@{0}".into(),
+                date: "2026-10-27T10:00:00Z".into(),
+                message: "On main: wip".into(),
+            }],
+            operation: operation.map(str::to_owned),
+        })));
+        app.jobs.clear();
+        app
+    }
+
+    fn local_write(app: &App) -> (LocalOp, String) {
+        match &app.jobs[..] {
+            [Job::GitWrite(_, GitOp::Local(op, text))] => (op.clone(), text.clone()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn switching_branch_previews_the_command_by_key_or_click() {
+        for by_click in [false, true] {
+            let mut app = with_refs(None);
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(
+                screen.contains("* main") && screen.contains("tip of feature"),
+                "{screen}"
+            );
+            if by_click {
+                click(&mut app, &Action::Select(1));
+                draw(&mut app, 120);
+                click(&mut app, &Action::Select(1)); // the selected branch
+            } else {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Enter);
+            }
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(screen.contains("Runs: git switch feature"), "{screen}");
+            assert!(app.jobs.is_empty(), "nothing runs before confirming");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(local_write(&app).0, LocalOp::Switch("feature".into()));
+            app.jobs.clear();
+            app.receive(Message::GitDone {
+                composed: true,
+                result: Ok("Switched to branch 'feature'".into()),
+            });
+            assert!(app.compose.is_none());
+            assert_eq!(app.status, "Switch branch: Switched to branch 'feature'");
+            assert!(app.jobs.contains(&Job::LoadRefs(Repo {
+                root: "/tmp/repo".into()
+            })));
+        }
+    }
+
+    #[test]
+    fn the_current_branch_is_refused_and_a_new_branch_needs_a_name() {
+        let mut app = with_refs(None);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "main is the current branch");
+        assert!(app.compose.is_none());
+        press(&mut app, KeyCode::Char('N'));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.compose.as_ref().unwrap().stage,
+            Stage::Editing,
+            "a name is needed"
+        );
+        type_text(&mut app, "topic");
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(
+            draw(&mut app, 120)
+                .join("\n")
+                .contains("Runs: git switch -c topic")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(local_write(&app), (LocalOp::CreateBranch, "topic".into()));
+    }
+
+    #[test]
+    fn a_rebase_previews_its_commits_and_a_stop_offers_continue_and_abort() {
+        let mut app = with_refs(None);
+        press(&mut app, KeyCode::Down);
+        draw(&mut app, 120);
+        click(&mut app, &Action::LocalOp(LocalChoice::Rebase));
+        assert_eq!(
+            app.jobs,
+            vec![Job::PlanRebase(
+                Repo {
+                    root: "/tmp/repo".into()
+                },
+                "feature".into()
+            )]
+        );
+        app.jobs.clear();
+        app.receive(Message::RebasePlan {
+            onto: "feature".into(),
+            result: Ok(RebasePlan {
+                replay: vec!["abc1234 My work".into()],
+                incoming: 2,
+            }),
+        });
+        let screen = draw(&mut app, 120).join("\n");
+        assert!(screen.contains("Runs: git rebase feature"), "{screen}");
+        assert!(
+            screen.contains("Replays 1 commit(s) onto feature, which has 2"),
+            "{screen}"
+        );
+        assert!(screen.contains("abc1234 My work"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(local_write(&app).0, LocalOp::Rebase { .. }));
+        app.receive(Message::GitDone {
+            composed: true,
+            result: Err("git rebase: CONFLICT (content)".into()),
+        });
+        assert!(app.compose.is_none());
+        assert!(
+            app.status.ends_with("B Branches: C Continue or X Abort"),
+            "{}",
+            app.status
+        );
+
+        let mut app = with_refs(Some("rebase"));
+        let screen = draw(&mut app, 120).join("\n");
+        assert!(screen.contains("A rebase stopped"), "{screen}");
+        assert!(screen.contains("C Continue rebase") && screen.contains("X Abort rebase"));
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.status, "Finish the rebase first: C Continue or X Abort");
+        click(&mut app, &Action::LocalOp(LocalChoice::Abort));
+        assert!(
+            draw(&mut app, 120)
+                .join("\n")
+                .contains("Runs: git rebase --abort")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(local_write(&app).0, LocalOp::RebaseAbort);
+    }
+
+    #[test]
+    fn stashes_show_and_push_pop_and_drop_through_previews() {
+        let mut app = with_refs(None);
+        press(&mut app, KeyCode::Char('S'));
+        let screen = draw(&mut app, 120).join("\n");
+        assert!(
+            screen.contains("stash@{0}") && screen.contains("On main: wip"),
+            "{screen}"
+        );
+        click(&mut app, &Action::Select(0)); // the selected stash shows
+        assert_eq!(
+            app.jobs,
+            vec![Job::ShowStash(
+                Repo {
+                    root: "/tmp/repo".into()
+                },
+                "stash@{0}".into()
+            )]
+        );
+        app.jobs.clear();
+        app.receive(Message::Commit {
+            sha: "stash@{0}".into(),
+            result: Ok("diff --git a/x b/x\n+stashed".into()),
+        });
+        assert!(draw(&mut app, 120).join("\n").contains("+stashed"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.local.commit.is_none());
+        // A stash message is optional.
+        press(&mut app, KeyCode::Char('Z'));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(
+            draw(&mut app, 120)
+                .join("\n")
+                .contains("Runs: git stash push --include-untracked")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(local_write(&app), (LocalOp::StashPush, String::new()));
+        app.jobs.clear();
+        app.compose = None;
+        for (key, op) in [
+            ('P', LocalOp::StashPop("stash@{0}".into())),
+            ('X', LocalOp::StashDrop("stash@{0}".into())),
+        ] {
+            press(&mut app, KeyCode::Char(key));
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(
+                screen.contains(&format!("Runs: {}", op.command(""))),
+                "{screen}"
+            );
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(local_write(&app).0, op);
+            app.jobs.clear();
+            app.compose = None;
+        }
     }
 }

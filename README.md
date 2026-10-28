@@ -56,12 +56,20 @@ with where they stand, and commenters, bots included.
 
 | Key | Action |
 | --- | --- |
-| `g` `w` `i` | History (git's graph of every branch) · Working changes · Staged changes |
+| `g` `w` `i` `B` `S` | History (git's graph of every branch) · Working changes · Staged changes · Branches · Stash |
 | `Enter` (History) | Show the selected commit |
 | `+` / `-` | Stage / unstage the selected file |
 | `Enter` (Working, Staged) or click a changed line | Put a cursor in the file's diff; `↑/↓` step between changed lines |
 | `+` / `-` · `L` (in the diff) | Stage / unstage the hunk under the cursor · just that line (`b` back to the files) |
 | `K` | Commit what is staged (preview shows branch, author, files and message) |
+
+**Branches:** `Enter` switches to the selected branch, `N` creates one at the current
+commit, `D` deletes a fully merged one (`git branch -d`), and `R` rebases the current
+branch onto it; its preview lists every commit it will replay. A rebase that stops on a
+conflict shows a banner with `C` Continue and `X` Abort.
+**Stash:** `Z` stashes every change, untracked files too, with an optional message;
+`Enter` shows a stash, `A` applies it, `P` pops it and `X` drops it.
+Each of these previews the exact git command and runs only after **Enter**.
 
 A hunk or line is staged with `git apply --cached` (`--reverse` to unstage), so the
 working tree is never touched; if the file changed since it was read, git refuses the

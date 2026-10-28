@@ -1,8 +1,9 @@
-//! Relative ages for GitHub's UTC timestamps (`2026-10-27T22:48:06Z`).
+//! Relative ages for RFC 3339 timestamps: GitHub's UTC ones (`2026-10-27T22:48:06Z`) and
+//! git's, which carry the committer's offset (`2026-10-27T18:48:06-04:00`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Seconds since the Unix epoch for an RFC 3339 UTC timestamp.
+/// Seconds since the Unix epoch for an RFC 3339 timestamp, in UTC or with an offset.
 pub fn parse(timestamp: &str) -> Option<i64> {
     let digits = |range: std::ops::Range<usize>| timestamp.get(range)?.parse::<i64>().ok();
     let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
@@ -14,7 +15,22 @@ pub fn parse(timestamp: &str) -> Option<i64> {
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+    // After the seconds: optional fractions, then `Z` or `±hh:mm` (local time ahead of
+    // UTC by that much, so it is taken off).
+    let zone = timestamp
+        .get(19..)?
+        .trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match zone.chars().next() {
+        None | Some('Z' | 'z') => 0,
+        Some(sign @ ('+' | '-')) => {
+            let hours: i64 = zone.get(1..3)?.parse().ok()?;
+            let minutes: i64 = zone.get(4..6)?.parse().ok()?;
+            let seconds = hours * 3600 + minutes * 60;
+            if sign == '+' { seconds } else { -seconds }
+        }
+        Some(_) => return None,
+    };
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset)
 }
 
 pub fn now() -> i64 {
@@ -79,6 +95,15 @@ mod tests {
         assert_eq!(parse("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse("2026-10-27T12:00:00Z"), Some(1_793_102_400));
         assert_eq!(parse("garbage"), None);
+    }
+
+    #[test]
+    fn git_offsets_and_fractions_are_honoured() {
+        let utc = parse("2026-10-27T12:00:00Z");
+        assert_eq!(parse("2026-10-27T08:00:00-04:00"), utc);
+        assert_eq!(parse("2026-10-27T17:30:00+05:30"), utc);
+        assert_eq!(parse("2026-10-27T12:00:00.123Z"), utc);
+        assert_eq!(parse("2026-10-27T12:00:00+0x:00"), None);
     }
 
     #[test]

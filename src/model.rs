@@ -147,6 +147,10 @@ pub enum WriteKind {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// A branch, stash or rebase operation on the local checkout.
+    Local {
+        op: crate::git::LocalOp,
+    },
     /// Commit the staged files of the local checkout (a local write, not GitHub).
     Commit {
         branch: String,
@@ -171,6 +175,22 @@ impl WriteKind {
             Self::Rerun { run, .. } => format!("Re-run failed jobs of {run}"),
             Self::CancelRun { run, .. } => format!("Cancel {run}"),
             Self::Commit { branch, .. } => format!("Commit on {branch}"),
+            Self::Local { op } => {
+                use crate::git::LocalOp as Op;
+                match op {
+                    Op::Switch(_) => "Switch branch",
+                    Op::CreateBranch => "New branch",
+                    Op::DeleteBranch(_) => "Delete branch",
+                    Op::Rebase { .. } => "Rebase",
+                    Op::RebaseContinue => "Continue rebase",
+                    Op::RebaseAbort => "Abort rebase",
+                    Op::StashPush => "Stash changes",
+                    Op::StashApply(_) => "Apply stash",
+                    Op::StashPop(_) => "Pop stash",
+                    Op::StashDrop(_) => "Drop stash",
+                }
+                .into()
+            }
             Self::MarkRead { .. } => "Mark read".into(),
             Self::MarkDone { .. } => "Mark done".into(),
             Self::Close => "Close".into(),
@@ -185,6 +205,11 @@ impl WriteKind {
 
     /// Whether the write has text at all (resolving a thread has none).
     pub fn has_text(&self) -> bool {
+        use crate::git::LocalOp;
+        if let Self::Local { op } = self {
+            // A branch needs its name; a stash may have a message.
+            return matches!(op, LocalOp::CreateBranch | LocalOp::StashPush);
+        }
         !matches!(
             self,
             Self::Resolve { .. }
@@ -204,7 +229,12 @@ impl WriteKind {
 
     /// Whether the text may be empty (an approval needs no words).
     pub fn body_optional(&self) -> bool {
-        self == &Self::Approve || !self.has_text()
+        self == &Self::Approve
+            || self
+                == &Self::Local {
+                    op: crate::git::LocalOp::StashPush,
+                }
+            || !self.has_text()
     }
 }
 
