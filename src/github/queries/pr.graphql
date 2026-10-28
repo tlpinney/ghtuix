@@ -1,0 +1,100 @@
+# One pull request page: everything the PR view shows except the diff text.
+query PrPage($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      title
+      url
+      bodyText
+      state
+      isDraft
+      createdAt
+      updatedAt
+      mergedAt
+      author {
+        __typename
+        login
+      }
+      headRefName
+      baseRefName
+      headRefOid
+      baseRefOid
+      additions
+      deletions
+      changedFiles
+      mergeable
+      reviewDecision
+      comments(first: 100) {
+        nodes {
+          author {
+            __typename
+            login
+          }
+          bodyText
+          createdAt
+        }
+      }
+      reviews(first: 50) {
+        nodes {
+          author {
+            __typename
+            login
+          }
+          state
+          bodyText
+          submittedAt
+        }
+      }
+      reviewThreads(first: 50) {
+        nodes {
+          isResolved
+          path
+          line
+          comments(first: 20) {
+            nodes {
+              author {
+                __typename
+                login
+              }
+              bodyText
+              createdAt
+            }
+          }
+        }
+      }
+      files(first: 100) {
+        nodes {
+          path
+          additions
+          deletions
+          changeType
+        }
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                    targetUrl
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

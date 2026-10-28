@@ -166,7 +166,7 @@ macro_rules! convert {
                 number: pr.number,
                 title: pr.title,
                 url: pr.url,
-                body: pr.body,
+                body: pr.body_text,
                 draft: pr.is_draft,
                 author,
                 created_at: pr.created_at,

@@ -10,12 +10,17 @@ use std::sync::Arc;
 
 pub mod budget;
 pub mod inbox;
+pub mod pr;
 pub mod viewer;
+
+/// Largest response body read (a big diff can be many megabytes).
+const MAX_BODY: u64 = 8 * 1024 * 1024;
 
 /// A signed-in connection to one GitHub host.
 #[derive(Clone)]
 pub struct Client {
     graphql_url: String,
+    rest_url: String,
     token: String,
     agent: ureq::Agent,
     /// Rate-limit budget and request slots, shared by every clone.
@@ -34,6 +39,7 @@ impl Client {
             .into();
         Ok(Self {
             graphql_url: graphql_url(host),
+            rest_url: rest_url(host),
             token,
             agent,
             gate: Arc::default(),
@@ -78,6 +84,50 @@ impl Client {
         parsed
             .data
             .ok_or_else(|| anyhow!("GitHub returned no data"))
+    }
+}
+
+impl Client {
+    /// One REST GET of `path` (relative to the API root) as text, with an `Accept` type
+    /// such as `application/vnd.github.diff`.
+    pub fn rest_text(&self, path: &str, accept: &str) -> Result<String> {
+        let url = format!("{}/{path}", self.rest_url);
+        let _slot = self
+            .gate
+            .enter(crate::time::now())
+            .map_err(|refused| anyhow!(refused))?;
+        let mut response = self
+            .agent
+            .get(&url)
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("Accept", accept)
+            .call()
+            .with_context(|| format!("Could not reach {url}"))?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        self.gate.observe(
+            status,
+            |name| Some(headers.get(name)?.to_str().ok()?.to_owned()),
+            crate::time::now(),
+        );
+        let text = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY)
+            .read_to_string()
+            .context("GitHub's response was too large or not text")?;
+        if !(200..300).contains(&status) {
+            bail!("GitHub returned HTTP {status}: {}", http_message(&text));
+        }
+        Ok(text)
+    }
+}
+
+fn rest_url(host: &str) -> String {
+    if host.eq_ignore_ascii_case("github.com") {
+        "https://api.github.com".into()
+    } else {
+        format!("https://{host}/api/v3")
     }
 }
 

@@ -5,6 +5,7 @@ mod github;
 mod inbox;
 mod keybar;
 mod model;
+mod pr;
 mod time;
 
 use anyhow::Result;
@@ -60,8 +61,16 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
             app.dispatch(app::Action::Refresh);
             last_refresh = Instant::now();
         }
-        for job in app.jobs.drain(..) {
-            spawn(job, host.clone(), session.clone(), tx.clone());
+        let jobs: Vec<Job> = app.jobs.drain(..).collect();
+        for job in jobs {
+            // The cache answers what has not changed; only the rest goes to GitHub.
+            match cache
+                .as_ref()
+                .and_then(|cache| from_cache(cache, &host, &job))
+            {
+                Some(message) => app.receive(message),
+                None => spawn(job, host.clone(), session.clone(), tx.clone()),
+            }
         }
         terminal.draw(|frame| app.draw(frame))?;
         if event::poll(Duration::from_millis(100))? {
@@ -81,19 +90,53 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Resul
     Ok(())
 }
 
-/// Keeps what a message brings for the next start. Cache errors are not worth an error.
-fn save(cache: &cache::Cache, host: &str, message: &Message) {
-    match message {
-        Message::SignedIn(Ok(login)) => {
-            let _ = cache.put(&cache::login_key(host), login);
+/// The cached answer to `job`, when the cache holds one that is still current: a PR page
+/// with the same `updatedAt` as the Inbox row, or the diff between the same two commits.
+fn from_cache(cache: &cache::Cache, host: &str, job: &Job) -> Option<Message> {
+    let (login, _) = cache.get::<String>(&cache::login_key(host))?;
+    match job {
+        Job::LoadPr {
+            repo,
+            number,
+            updated_at: Some(updated_at),
+        } => {
+            let key = cache::pr_key(host, &login, repo, *number);
+            let (page, _) = cache.get::<model::PrPage>(&key)?;
+            (page.updated_at == *updated_at).then(|| Message::Pr(Ok(Box::new(page))))
         }
-        Message::Inbox(Ok(prs)) => {
-            if let Some((login, _)) = cache.get::<String>(&cache::login_key(host)) {
-                let _ = cache.put(&cache::inbox_key(host, &login), prs);
-            }
+        Job::LoadDiff { base, head, .. } => {
+            let (diff, _) = cache.get::<String>(&cache::diff_key(host, &login, base, head))?;
+            Some(Message::Diff {
+                base: base.clone(),
+                head: head.clone(),
+                result: Ok(diff),
+            })
         }
-        _ => {}
+        _ => None,
     }
+}
+
+/// Keeps what a message brings for later. Cache errors are not worth an error.
+fn save(cache: &cache::Cache, host: &str, message: &Message) {
+    if let Message::SignedIn(Ok(login)) = message {
+        let _ = cache.put(&cache::login_key(host), login);
+        return;
+    }
+    let Some((login, _)) = cache.get::<String>(&cache::login_key(host)) else {
+        return;
+    };
+    let _ = match message {
+        Message::Inbox(Ok(prs)) => cache.put(&cache::inbox_key(host, &login), prs),
+        Message::Pr(Ok(page)) => {
+            cache.put(&cache::pr_key(host, &login, &page.repo, page.number), page)
+        }
+        Message::Diff {
+            base,
+            head,
+            result: Ok(diff),
+        } => cache.put(&cache::diff_key(host, &login, base, head), diff),
+        _ => Ok(()),
+    };
 }
 
 /// Runs one job on a background thread; its result comes back as a `Message`.
@@ -120,6 +163,21 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
             Job::LoadInbox => {
                 Message::Inbox(client().and_then(|c| github::inbox::open(&c).map_err(text)))
             }
+            Job::LoadPr { repo, number, .. } => Message::Pr(client().and_then(|c| {
+                github::pr::page(&c, &repo, number)
+                    .map(Box::new)
+                    .map_err(text)
+            })),
+            Job::LoadDiff {
+                repo,
+                number,
+                base,
+                head,
+            } => Message::Diff {
+                base,
+                head,
+                result: client().and_then(|c| github::pr::diff(&c, &repo, number).map_err(text)),
+            },
             Job::LoadMerged => {
                 Message::Merged(client().and_then(|c| github::inbox::merged(&c).map_err(text)))
             }

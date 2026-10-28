@@ -110,6 +110,75 @@ impl PullRequest {
     }
 }
 
+/// One item of a PR's conversation: a comment or a submitted review.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub author: Person,
+    pub body: String,
+    pub at: String,
+    /// `None` for a comment; the review's stance for a review.
+    pub review: Option<Stance>,
+}
+
+/// A review thread on a line of a changed file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Thread {
+    pub path: String,
+    pub line: Option<i64>,
+    pub resolved: bool,
+    pub comments: Vec<Entry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub additions: i64,
+    pub deletions: i64,
+    /// `added`, `modified`, `renamed`, …
+    pub change: String,
+}
+
+/// One check run or commit status on the head commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub name: String,
+    pub state: Checks,
+    /// GitHub's wording for the state, such as `success` or `in progress`.
+    pub detail: String,
+    pub url: Option<String>,
+}
+
+/// Everything the PR view shows, read in one query (the diff comes separately).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrPage {
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    pub body: String,
+    /// `open`, `closed` or `merged`.
+    pub state: String,
+    pub draft: bool,
+    pub author: Person,
+    pub created_at: String,
+    pub updated_at: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub head_oid: String,
+    pub base_oid: String,
+    pub additions: i64,
+    pub deletions: i64,
+    pub changed_files: i64,
+    /// `mergeable`, `conflicting` or `unknown`.
+    pub mergeable: String,
+    pub decision: Decision,
+    /// Comments and reviews, oldest first.
+    pub conversation: Vec<Entry>,
+    pub threads: Vec<Thread>,
+    pub files: Vec<FileChange>,
+    pub checks: Vec<Check>,
+}
+
 /// Adds `person` with `stance`, keeping one entry per login (the most significant stance).
 pub fn add_reviewer(reviewers: &mut Vec<Reviewer>, person: Person, stance: Stance) {
     if person.login.is_empty() {

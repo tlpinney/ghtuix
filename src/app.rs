@@ -2,7 +2,8 @@
 
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
-use crate::model::PullRequest;
+use crate::model::{PrPage, PullRequest};
+use crate::pr::{PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
@@ -31,6 +32,11 @@ pub enum Action {
     Tab(Tab),
     Select(usize),
     Move(isize),
+    /// Open the selected PR.
+    Open,
+    /// Leave the open PR.
+    Back,
+    PrTab(PrTab),
     OpenInBrowser,
     Refresh,
     Quit,
@@ -42,6 +48,13 @@ pub enum Message {
     SignedIn(Result<String, String>),
     Inbox(Result<Vec<PullRequest>, String>),
     Merged(Result<Vec<PullRequest>, String>),
+    Pr(Result<Box<PrPage>, String>),
+    /// The diff between two commits of an open PR.
+    Diff {
+        base: String,
+        head: String,
+        result: Result<String, String>,
+    },
 }
 
 /// What the UI thread asks the background to do.
@@ -50,12 +63,26 @@ pub enum Job {
     SignIn,
     LoadInbox,
     LoadMerged,
+    /// Read a PR page; with `updated_at`, a cached page of that version may answer.
+    LoadPr {
+        repo: String,
+        number: i64,
+        updated_at: Option<String>,
+    },
+    LoadDiff {
+        repo: String,
+        number: i64,
+        base: String,
+        head: String,
+    },
     Open(String),
 }
 
 pub struct App {
     pub view: View,
     pub inbox: Inbox,
+    /// The PR opened from the Inbox, if any.
+    pub pr: Option<PrView>,
     pub login: Option<String>,
     /// The account the cached Inbox belongs to, until sign-in confirms it.
     cached_login: Option<String>,
@@ -74,6 +101,7 @@ impl Default for App {
         Self {
             view: View::Inbox,
             inbox: Inbox::default(),
+            pr: None,
             login: None,
             cached_login: None,
             status: "Signing in…".into(),
@@ -97,17 +125,59 @@ impl App {
                     self.load(Job::LoadMerged);
                 }
             }
+            // Clicking the row that is already selected opens it.
+            Action::Select(index) if index == self.inbox.selected => self.dispatch(Action::Open),
             Action::Select(index) => self.inbox.select(index),
-            Action::Move(delta) => self.inbox.move_selection(delta),
-            Action::OpenInBrowser => match self.inbox.selected_pr() {
-                Some(pr) => {
-                    self.status = format!("Opening {} in the browser", pr.reference());
-                    self.jobs.push(Job::Open(pr.url.clone()));
-                }
-                None => self.status = "Select a pull request first".into(),
+            Action::Move(delta) => match &mut self.pr {
+                Some(pr) => pr.scroll_by(delta),
+                None => self.inbox.move_selection(delta),
             },
+            Action::Open => {
+                if let Some(pr) = self.inbox.selected_pr().cloned() {
+                    self.jobs.push(Job::LoadPr {
+                        repo: pr.repo.clone(),
+                        number: pr.number,
+                        updated_at: Some(pr.updated_at.clone()),
+                    });
+                    self.pr = Some(PrView::new(pr));
+                }
+            }
+            Action::Back => self.pr = None,
+            Action::PrTab(tab) => {
+                if let Some(pr) = &mut self.pr {
+                    pr.tab = tab;
+                    pr.scroll = 0;
+                }
+                self.load_diff_if_needed();
+            }
+            Action::OpenInBrowser => {
+                let target = match &self.pr {
+                    Some(pr) => Some((pr.summary.reference(), pr.url().to_owned())),
+                    None => self
+                        .inbox
+                        .selected_pr()
+                        .map(|pr| (pr.reference(), pr.url.clone())),
+                };
+                match target {
+                    Some((reference, url)) => {
+                        self.status = format!("Opening {reference} in the browser");
+                        self.jobs.push(Job::Open(url));
+                    }
+                    None => self.status = "Select a pull request first".into(),
+                }
+            }
             Action::Refresh => {
-                if self.login.is_none() {
+                if let Some(pr) = &mut self.pr {
+                    if !pr.loading {
+                        pr.loading = true;
+                        pr.error = None;
+                        self.jobs.push(Job::LoadPr {
+                            repo: pr.summary.repo.clone(),
+                            number: pr.summary.number,
+                            updated_at: None,
+                        });
+                    }
+                } else if self.login.is_none() {
                     self.jobs.push(Job::SignIn);
                 } else if self.inbox.tab == Tab::Merged {
                     self.load(Job::LoadMerged);
@@ -125,6 +195,21 @@ impl App {
         self.inbox.open.fetched_at = Some(saved_at);
         self.inbox.open.cached = true;
         self.cached_login = Some(login);
+    }
+
+    /// Asks for the open PR's diff when its Files tab shows and the diff is missing.
+    fn load_diff_if_needed(&mut self) {
+        let Some(pr) = &mut self.pr else { return };
+        let Some(page) = &pr.page else { return };
+        if pr.tab == PrTab::Files && pr.diff.is_none() && !pr.diff_loading {
+            pr.diff_loading = true;
+            self.jobs.push(Job::LoadDiff {
+                repo: page.repo.clone(),
+                number: page.number,
+                base: page.base_oid.clone(),
+                head: page.head_oid.clone(),
+            });
+        }
     }
 
     /// Queues a list load unless one is already running.
@@ -158,6 +243,43 @@ impl App {
             Message::SignedIn(Err(error)) => self.status = error,
             Message::Inbox(result) => self.inbox.open.finish(result),
             Message::Merged(result) => self.inbox.merged.finish(result),
+            Message::Pr(result) => {
+                if let Some(pr) = &mut self.pr {
+                    pr.loading = false;
+                    match result {
+                        Ok(page)
+                            if page.repo == pr.summary.repo && page.number == pr.summary.number =>
+                        {
+                            // A new head or base makes the old diff wrong.
+                            let same = pr.page.as_ref().is_some_and(|old| {
+                                old.head_oid == page.head_oid && old.base_oid == page.base_oid
+                            });
+                            if !same {
+                                pr.diff = None;
+                            }
+                            pr.page = Some(*page);
+                            pr.error = None;
+                        }
+                        Ok(_) => {}
+                        Err(error) => pr.error = Some(error),
+                    }
+                }
+                self.load_diff_if_needed();
+            }
+            Message::Diff { base, head, result } => {
+                if let Some(pr) = &mut self.pr
+                    && pr
+                        .page
+                        .as_ref()
+                        .is_some_and(|page| page.base_oid == base && page.head_oid == head)
+                {
+                    pr.diff_loading = false;
+                    match result {
+                        Ok(diff) => pr.diff = Some(diff),
+                        Err(error) => pr.diff = Some(format!("The diff could not load: {error}")),
+                    }
+                }
+            }
         }
         self.inbox.move_selection(0);
     }
@@ -197,7 +319,22 @@ impl App {
     /// The controls of the current view, in priority order (the key bar draws what fits).
     fn controls(&self) -> Vec<Control> {
         let mut controls = Vec::new();
-        if self.view == View::Inbox {
+        if self.view == View::Inbox && self.pr.is_some() {
+            controls.push(Control::new(KeyCode::Char('b'), "Back", Action::Back));
+            controls.push(Control::hidden(KeyCode::Left, Action::Back));
+            controls.push(Control::hidden(KeyCode::Esc, Action::Back));
+            controls.push(Control::new(
+                KeyCode::Char('w'),
+                "Web",
+                Action::OpenInBrowser,
+            ));
+            controls.extend(
+                PrTab::ALL
+                    .iter()
+                    .map(|(tab, key, _)| Control::hidden(KeyCode::Char(*key), Action::PrTab(*tab))),
+            );
+        } else if self.view == View::Inbox {
+            controls.push(Control::new(KeyCode::Enter, "Open", Action::Open));
             controls.push(Control::new(
                 KeyCode::Char('w'),
                 "Web",
@@ -237,7 +374,10 @@ impl App {
             header,
         );
         let mut hits = match self.view {
-            View::Inbox => self.inbox.draw(frame, body),
+            View::Inbox => match &mut self.pr {
+                Some(pr) => pr.draw(frame, body),
+                None => self.inbox.draw(frame, body),
+            },
             View::Local => {
                 frame.render_widget(
                     Paragraph::new(" Local Git comes in a later step.")
@@ -369,6 +509,49 @@ mod tests {
                 app.jobs,
                 vec![Job::Open("https://github.com/o/b/pull/2".into())]
             );
+        }
+    }
+
+    #[test]
+    fn a_pr_opens_by_enter_or_click_loads_its_diff_on_files_and_goes_back() {
+        for by_click in [false, true] {
+            let mut app = signed_in();
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::Select(0)); // already selected: opens
+            } else {
+                press(&mut app, KeyCode::Enter);
+            }
+            assert_eq!(
+                app.jobs,
+                vec![Job::LoadPr {
+                    repo: "o/a".into(),
+                    number: 1,
+                    updated_at: Some("2026-10-27T11:00:00Z".into())
+                }]
+            );
+            app.jobs.clear();
+            app.receive(Message::Pr(Ok(Box::new(crate::pr::tests::page()))));
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("feature → main"), "{screen}");
+            if by_click {
+                click(&mut app, &Action::PrTab(PrTab::Files));
+            } else {
+                press(&mut app, KeyCode::Char('f'));
+            }
+            assert!(matches!(app.jobs.as_slice(), [Job::LoadDiff { .. }]));
+            app.receive(Message::Diff {
+                base: "b".repeat(40),
+                head: "a".repeat(40),
+                result: Ok("+added line".into()),
+            });
+            assert!(draw(&mut app, 140).join("\n").contains("+added line"));
+            if by_click {
+                click(&mut app, &Action::Back);
+            } else {
+                press(&mut app, KeyCode::Left);
+            }
+            assert!(app.pr.is_none());
         }
     }
 

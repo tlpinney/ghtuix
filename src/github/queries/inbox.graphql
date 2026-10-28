@@ -42,7 +42,7 @@ fragment Pr on PullRequest {
   number
   title
   url
-  body
+  bodyText
   isDraft
   createdAt
   updatedAt

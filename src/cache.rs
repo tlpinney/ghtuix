@@ -8,6 +8,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 
+/// The shape of what the cache stores. Bump it whenever a cached type changes meaning
+/// (a field added, a body read differently): older entries are then dropped on open.
+const FORMAT: i32 = 2;
+
 pub struct Cache {
     db: Connection,
 }
@@ -26,6 +30,11 @@ impl Cache {
                  saved_at INTEGER NOT NULL
              );",
         )?;
+        let format: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if format != FORMAT {
+            db.execute("DELETE FROM entries", [])?;
+            db.execute_batch(&format!("PRAGMA user_version = {FORMAT};"))?;
+        }
         Ok(Self { db })
     }
 
@@ -70,6 +79,16 @@ pub fn inbox_key(host: &str, login: &str) -> String {
     format!("{host}/{login}/inbox")
 }
 
+/// Where an account's copy of a PR page is stored.
+pub fn pr_key(host: &str, login: &str, repo: &str, number: i64) -> String {
+    format!("{host}/{login}/pr/{repo}#{number}")
+}
+
+/// Where the diff between two commits is stored (it never changes).
+pub fn diff_key(host: &str, login: &str, base: &str, head: &str) -> String {
+    format!("{host}/{login}/diff/{base}..{head}")
+}
+
 /// The account last signed in on `host`.
 pub fn login_key(host: &str) -> String {
     format!("{host}/login")
@@ -84,6 +103,16 @@ mod tests {
         let path = dir.join(format!("{:?}.sqlite3", std::thread::current().id()));
         let _ = std::fs::remove_file(&path);
         (Cache::open(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn a_new_format_drops_older_entries() {
+        let (cache, path) = cache();
+        cache.put("k", &1).unwrap();
+        cache.db.execute_batch("PRAGMA user_version = 1;").unwrap();
+        drop(cache);
+        let reopened = Cache::open(&path).unwrap();
+        assert!(reopened.get::<i32>("k").is_none());
     }
 
     #[test]
