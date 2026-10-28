@@ -20,11 +20,22 @@ impl<'a> FileDiff<'a> {
     /// Splits a one-file diff (as `git::diff_of` returns it); `None` without hunks, as for
     /// a binary file or a mode change.
     pub fn parse(diff: &'a str) -> Option<Self> {
-        let lines: Vec<&str> = diff.lines().collect();
+        // Lines keep their endings, so a CRLF file's `\r` survives into the patch.
+        let lines: Vec<&str> = diff.split_inclusive('\n').collect();
+        // A conflict's combined diff, a rename or a copy is staged whole: a partial
+        // patch cannot express it (reversed, a rename header would undo the rename).
+        let whole_only = |line: &&str| {
+            line.starts_with("diff --cc ")
+                || line.starts_with("rename from ")
+                || line.starts_with("copy from ")
+        };
         let starts: Vec<usize> = (0..lines.len())
             .filter(|&i| lines[i].starts_with("@@"))
             .collect();
         let first_hunk = *starts.first()?;
+        if lines[..first_hunk].iter().any(whole_only) {
+            return None;
+        }
         let hunks = starts
             .iter()
             .enumerate()
@@ -54,11 +65,14 @@ impl<'a> FileDiff<'a> {
             .find(|&(start, end)| (start..end).contains(&index))
     }
 
+    /// The file headers, without a mode change: staging part of the text should not
+    /// stage the mode too.
     fn header(&self) -> String {
         let mut out = String::new();
         for line in &self.lines[..self.first_hunk] {
-            out.push_str(line);
-            out.push('\n');
+            if !line.starts_with("old mode ") && !line.starts_with("new mode ") {
+                push(&mut out, line);
+            }
         }
         out
     }
@@ -68,8 +82,7 @@ impl<'a> FileDiff<'a> {
         let (start, end) = self.hunk_of(index)?;
         let mut out = self.header();
         for line in &self.lines[start..end] {
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, line);
         }
         Some(out)
     }
@@ -82,8 +95,7 @@ impl<'a> FileDiff<'a> {
         }
         let (start, end) = self.hunk_of(index)?;
         let mut out = self.header();
-        out.push_str(self.lines[start]);
-        out.push('\n');
+        push(&mut out, self.lines[start]);
         // The kind of line that does not exist on the side the patch applies to.
         let absent = if reverse { '-' } else { '+' };
         let mut kept_previous = true;
@@ -93,27 +105,30 @@ impl<'a> FileDiff<'a> {
             let kept = if kind == '\\' {
                 // "\ No newline at end of file" belongs to the line before it.
                 if kept_previous {
-                    out.push_str(line);
-                    out.push('\n');
+                    push(&mut out, line);
                 }
                 continue;
             } else if at == index || kind == ' ' {
-                out.push_str(line);
+                push(&mut out, line);
                 true
             } else if kind == absent {
                 false
             } else {
                 // Present on the patch's side but not chosen: unchanged context.
-                out.push(' ');
-                out.push_str(&line[1..]);
+                push(&mut out, &format!(" {}", &line[1..]));
                 true
             };
-            if kept {
-                out.push('\n');
-            }
             kept_previous = kept;
         }
         Some(out)
+    }
+}
+
+/// Adds one diff line, ending it with `\n` unless it already ends (`\n` or `\r\n`).
+fn push(out: &mut String, line: &str) {
+    out.push_str(line);
+    if !line.ends_with('\n') {
+        out.push('\n');
     }
 }
 
@@ -176,5 +191,30 @@ index 1111111..2222222 100644
             "{patch}"
         );
         assert_eq!(FileDiff::parse("Binary files a/x and b/x differ\n"), None);
+    }
+
+    #[test]
+    fn crlf_lines_keep_their_endings_and_renames_are_staged_whole() {
+        let crlf =
+            "diff --git a/w b/w\n--- a/w\n+++ b/w\n@@ -1,2 +1,2 @@\r\n one\r\n-two\r\n+TWO\r\n";
+        let diff = FileDiff::parse(crlf).unwrap();
+        assert!(
+            diff.line_patch(6, false)
+                .unwrap()
+                .ends_with(" one\r\n two\r\n+TWO\r\n")
+        );
+        assert!(
+            diff.line_patch(5, false)
+                .unwrap()
+                .ends_with(" one\r\n-two\r\n")
+        );
+        let renamed = "diff --git a/old b/new\nsimilarity index 90%\nrename from old\nrename to new\n--- a/old\n+++ b/new\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(FileDiff::parse(renamed), None);
+        let conflict =
+            "diff --cc f\nindex 1,2..0\n--- a/f\n+++ b/f\n@@@ -1,1 -1,1 +1,5 @@@\n++<<<<<<< HEAD\n";
+        assert_eq!(FileDiff::parse(conflict), None);
+        let mode = "diff --git a/s b/s\nold mode 100644\nnew mode 100755\n--- a/s\n+++ b/s\n@@ -1 +1 @@\n-a\n+b\n";
+        let patch = FileDiff::parse(mode).unwrap().hunk_patch(6).unwrap();
+        assert!(!patch.contains("mode"), "{patch}");
     }
 }

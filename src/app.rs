@@ -596,7 +596,9 @@ impl App {
             Action::DiffLine(index) => self.local.place_line(index),
             Action::Open if self.view == View::Local && self.local.tab.has_files() => {
                 if !self.local.enter_diff() {
-                    self.status = "This file has no text hunks; + stages it whole".into();
+                    self.status = "Stage this file whole (+ or -): it has no text hunks, or is a \
+                                   rename or a conflict"
+                        .into();
                 }
             }
             Action::Back if self.view == View::Local && self.local.line.is_some() => {
@@ -1247,7 +1249,7 @@ impl App {
             return;
         };
         let branch = self.local.selected_branch().cloned();
-        let stash = self.local.selected_stash().map(|s| s.name.clone());
+        let stash = self.local.selected_stash().cloned();
         let rebasing = self.local.rebasing();
         let op = match choice {
             LocalChoice::Continue | LocalChoice::Abort if !rebasing => {
@@ -3522,8 +3524,17 @@ mod tests {
         assert_eq!(app.view, View::Local);
     }
 
+    fn stash() -> crate::git::Stash {
+        crate::git::Stash {
+            name: "stash@{0}".into(),
+            date: "2026-10-27T10:00:00Z".into(),
+            message: "On main: wip".into(),
+            sha: "c".repeat(40),
+        }
+    }
+
     fn with_refs(operation: Option<&str>) -> App {
-        use crate::git::{Branch, Stash};
+        use crate::git::Branch;
         let mut app = App {
             local: Local::new(Ok(Repo {
                 root: "/tmp/repo".into(),
@@ -3543,11 +3554,7 @@ mod tests {
         };
         app.receive(Message::Refs(Ok(Refs {
             branches: vec![branch("main", true), branch("feature", false)],
-            stashes: vec![Stash {
-                name: "stash@{0}".into(),
-                date: "2026-10-27T10:00:00Z".into(),
-                message: "On main: wip".into(),
-            }],
+            stashes: vec![stash()],
             operation: operation.map(str::to_owned),
         })));
         app.jobs.clear();
@@ -3719,8 +3726,8 @@ mod tests {
         app.jobs.clear();
         app.compose = None;
         for (key, op) in [
-            ('P', LocalOp::StashPop("stash@{0}".into())),
-            ('X', LocalOp::StashDrop("stash@{0}".into())),
+            ('P', LocalOp::StashPop(stash())),
+            ('X', LocalOp::StashDrop(stash())),
         ] {
             press(&mut app, KeyCode::Char(key));
             let screen = draw(&mut app, 120).join("\n");

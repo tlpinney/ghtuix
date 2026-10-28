@@ -159,6 +159,12 @@ impl Compose {
                 LocalOp::StashPop(_) => "The stash is removed once it applies cleanly.",
                 LocalOp::StashDrop(_) => "The stash is deleted.",
             };
+            if let LocalOp::StashApply(stash)
+            | LocalOp::StashPop(stash)
+            | LocalOp::StashDrop(stash) = op
+            {
+                lines.push(Line::raw(format!("Stash: {}", stash.message)));
+            }
             if !note.is_empty() {
                 lines.push(Line::raw(note));
             }

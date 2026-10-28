@@ -57,6 +57,8 @@ pub struct Stash {
     pub name: String,
     pub date: String,
     pub message: String,
+    /// The stash's commit: `stash@{N}` moves when stashes are added, this does not.
+    pub sha: String,
 }
 
 /// Branches, stashes and an operation left in progress (a rebase that stopped).
@@ -91,9 +93,9 @@ pub enum LocalOp {
     RebaseAbort,
     /// Stash every change, untracked files too; the message is the compose box's text.
     StashPush,
-    StashApply(String),
-    StashPop(String),
-    StashDrop(String),
+    StashApply(Stash),
+    StashPop(Stash),
+    StashDrop(Stash),
 }
 
 impl LocalOp {
@@ -107,11 +109,11 @@ impl LocalOp {
             Self::Rebase { onto, .. } => format!("git rebase {onto}"),
             Self::RebaseContinue => "git rebase --continue".into(),
             Self::RebaseAbort => "git rebase --abort".into(),
-            Self::StashPush if text.is_empty() => "git stash push --include-untracked".into(),
-            Self::StashPush => format!("git stash push --include-untracked -m \"{text}\""),
-            Self::StashApply(stash) => format!("git stash apply {stash}"),
-            Self::StashPop(stash) => format!("git stash pop {stash}"),
-            Self::StashDrop(stash) => format!("git stash drop {stash}"),
+            Self::StashPush if text.is_empty() => "git stash push --include-untracked -- .".into(),
+            Self::StashPush => format!("git stash push --include-untracked -m \"{text}\" -- ."),
+            Self::StashApply(stash) => format!("git stash apply {}", stash.name),
+            Self::StashPop(stash) => format!("git stash pop {}", stash.name),
+            Self::StashDrop(stash) => format!("git stash drop {}", stash.name),
         }
     }
 }
@@ -243,7 +245,7 @@ impl Repo {
                 })
             })
             .collect();
-        let out = self.git(&["stash", "list", "--format=%gd%x1f%cI%x1f%gs"])?;
+        let out = self.git(&["stash", "list", "--format=%gd%x1f%cI%x1f%gs%x1f%H"])?;
         let stashes = out
             .lines()
             .filter_map(|line| {
@@ -252,6 +254,7 @@ impl Repo {
                     name: fields.next()?.to_owned(),
                     date: fields.next().unwrap_or_default().to_owned(),
                     message: fields.next().unwrap_or_default().to_owned(),
+                    sha: fields.next().unwrap_or_default().to_owned(),
                 })
             })
             .collect();
@@ -331,7 +334,13 @@ impl Repo {
                 write(&self.root, &args, None)?
             }
             LocalOp::StashApply(stash) | LocalOp::StashPop(stash) | LocalOp::StashDrop(stash) => {
-                check_ref(stash)?;
+                check_ref(&stash.name)?;
+                // Refuse if stashing since the list was read moved this name.
+                let now = self.git(&["rev-parse", "--verify", "-q", &stash.name]);
+                if now.map(|sha| sha.trim().to_owned()).ok().as_deref() != Some(&stash.sha) {
+                    bail!("The stash list changed since it was read; press r and choose again");
+                }
+                let stash = stash.name.as_str();
                 let verb = match op {
                     LocalOp::StashApply(_) => "apply",
                     LocalOp::StashPop(_) => "pop",
@@ -470,6 +479,8 @@ pub fn diff_of(diff: &str, path: &str) -> String {
     for line in diff.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
             inside = line.trim_end().ends_with(&format!(" b/{path}"));
+        } else if let Some(conflicted) = line.strip_prefix("diff --cc ") {
+            inside = conflicted.trim_end() == path;
         }
         if inside {
             out.push_str(line);
@@ -517,6 +528,11 @@ fn parse_status(out: &str) -> Status {
             }
         } else if let Some(path) = line.strip_prefix("? ") {
             status.unstaged.push((path.to_owned(), '?'));
+        } else if let Some(rest) = line.strip_prefix("u ") {
+            // A conflict: `u XY sub m1 m2 m3 mW h1 h2 h3 path`. It is staged (resolved)
+            // whole, from the Working list.
+            let path = rest.splitn(10, ' ').nth(9).unwrap_or_default();
+            status.unstaged.push((path.to_owned(), 'U'));
         } else if let Some((rest, fields)) = line
             .strip_prefix("1 ")
             .map(|rest| (rest, 8))
@@ -715,7 +731,15 @@ mod tests {
         assert!(refs.stashes[0].message.contains("wip"));
         assert!(repo.stash_show("stash@{0}").unwrap().contains("+three"));
         assert!(repo.status().unwrap().unstaged.is_empty());
-        op(LocalOp::StashPop("stash@{0}".into()), "").unwrap();
+        // A stash made since the list was read moves stash@{0}: that is refused.
+        let listed = repo.refs().unwrap().stashes[0].clone();
+        std::fs::write(dir.join("a.txt"), "other\n").unwrap();
+        op(LocalOp::StashPush, "newer").unwrap();
+        assert!(op(LocalOp::StashDrop(listed.clone()), "").is_err());
+        let newer = repo.refs().unwrap().stashes[0].clone();
+        op(LocalOp::StashDrop(newer), "").unwrap();
+        assert_eq!(repo.refs().unwrap().stashes[0].sha, listed.sha);
+        op(LocalOp::StashPop(listed), "").unwrap();
         assert!(dir.join("new.txt").exists());
         assert!(repo.refs().unwrap().stashes.is_empty());
         repo.stage("a.txt").unwrap();
@@ -776,6 +800,72 @@ mod tests {
             "feature side\n"
         );
         assert!(repo.rebase_plan("--output=x").is_err());
+    }
+
+    #[test]
+    fn a_stopped_rebase_shows_its_conflict_and_continues_once_resolved() {
+        let (repo, dir) = repo();
+        let op = |op: LocalOp, text: &str| repo.local_op(&op, text);
+        repo.stage("a.txt").unwrap();
+        repo.stage("new.txt").unwrap();
+        repo.commit("Base").unwrap();
+        op(LocalOp::CreateBranch, "topic").unwrap();
+        std::fs::write(dir.join("a.txt"), "topic side\n").unwrap();
+        repo.stage("a.txt").unwrap();
+        repo.commit("Topic edit").unwrap();
+        op(LocalOp::Switch("main".into()), "").unwrap();
+        std::fs::write(dir.join("a.txt"), "main side\n").unwrap();
+        repo.stage("a.txt").unwrap();
+        repo.commit("Main edit").unwrap();
+        op(LocalOp::Switch("topic".into()), "").unwrap();
+        let plan = repo.rebase_plan("main").unwrap();
+        assert!(
+            op(
+                LocalOp::Rebase {
+                    onto: "main".into(),
+                    plan
+                },
+                ""
+            )
+            .is_err()
+        );
+        let status = repo.status().unwrap();
+        assert!(
+            status.unstaged.contains(&("a.txt".to_string(), 'U')),
+            "{status:?}"
+        );
+        assert!(diff_of(&repo.working_diff().unwrap(), "a.txt").contains("<<<<<<<"));
+        // Resolve, stage the file whole, continue (no editor may open).
+        std::fs::write(dir.join("a.txt"), "both sides\n").unwrap();
+        repo.stage("a.txt").unwrap();
+        op(LocalOp::RebaseContinue, "").unwrap();
+        assert_eq!(repo.refs().unwrap().operation, None);
+        let history = repo.history(3).unwrap();
+        assert_eq!(history[0].commit.as_ref().unwrap().subject, "Topic edit");
+    }
+
+    #[test]
+    fn one_line_of_a_crlf_file_stages_with_its_ending() {
+        use crate::patch::FileDiff;
+        let (repo, dir) = repo();
+        repo.stage("a.txt").unwrap();
+        repo.commit("Base").unwrap();
+        std::fs::write(dir.join("w.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+        repo.stage("w.txt").unwrap();
+        repo.commit("CRLF file").unwrap();
+        std::fs::write(dir.join("w.txt"), "one\r\nTWO\r\nthree\r\nfour\r\n").unwrap();
+        let working = diff_of(&repo.working_diff().unwrap(), "w.txt");
+        let at = working
+            .split_inclusive('\n')
+            .position(|l| l == "+four\r\n")
+            .unwrap();
+        let patch = FileDiff::parse(&working)
+            .unwrap()
+            .line_patch(at, false)
+            .unwrap();
+        repo.apply_cached(&patch, false).unwrap();
+        let staged = repo.git(&["show", ":w.txt"]).unwrap();
+        assert_eq!(staged, "one\r\ntwo\r\nthree\r\nfour\r\n");
     }
 
     #[test]
