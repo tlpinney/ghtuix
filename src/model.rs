@@ -262,6 +262,24 @@ pub struct Check {
     pub url: Option<String>,
 }
 
+/// One commit of a pull request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrCommit {
+    pub oid: String,
+    pub headline: String,
+    pub author: String,
+    pub date: String,
+    pub checks: Checks,
+}
+
+/// One timeline event: who did what, when.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub at: String,
+    pub actor: String,
+    pub text: String,
+}
+
 /// Everything the PR view shows, read in one query (the diff comes separately).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrPage {

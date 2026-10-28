@@ -8,7 +8,7 @@ use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
 use crate::log::LogView;
-use crate::model::{MergeMethod, PrPage, PullRequest, WriteKind};
+use crate::model::{Event, MergeMethod, PrCommit, PrPage, PullRequest, WriteKind};
 use crate::pr::{Anchor, PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -111,6 +111,15 @@ pub enum Message {
         sha: String,
         result: Result<String, String>,
     },
+    /// A PR's commits or timeline, read when its tab first showed.
+    PrCommits {
+        number: i64,
+        result: Result<Vec<PrCommit>, String>,
+    },
+    PrTimeline {
+        number: i64,
+        result: Result<Vec<Event>, String>,
+    },
     /// An Actions job's log.
     Log {
         repo: String,
@@ -150,6 +159,14 @@ pub enum Job {
         number: i64,
         base: String,
         head: String,
+    },
+    LoadPrCommits {
+        repo: String,
+        number: i64,
+    },
+    LoadPrTimeline {
+        repo: String,
+        number: i64,
     },
     /// Download a job's log; a finished job's log may come from the cache.
     LoadLog {
@@ -550,6 +567,13 @@ impl App {
             Action::PrTab(tab) => {
                 if let Some(pr) = &mut self.pr {
                     pr.switch(tab);
+                    // Commits and the timeline are read only when their tab is looked at.
+                    let (repo, number) = (pr.summary.repo.clone(), pr.summary.number);
+                    if tab == PrTab::Commits && pr.commits.is_none() {
+                        self.jobs.push(Job::LoadPrCommits { repo, number });
+                    } else if tab == PrTab::Timeline && pr.timeline.is_none() {
+                        self.jobs.push(Job::LoadPrTimeline { repo, number });
+                    }
                 }
                 self.load_diff_if_needed();
             }
@@ -735,6 +759,15 @@ impl App {
                             if !same {
                                 pr.diff = None;
                             }
+                            // A newer version of the PR makes the history stale.
+                            if pr
+                                .page
+                                .as_ref()
+                                .is_some_and(|old| old.updated_at != page.updated_at)
+                            {
+                                pr.commits = None;
+                                pr.timeline = None;
+                            }
                             pr.page = Some(*page);
                             pr.error = None;
                         }
@@ -775,6 +808,20 @@ impl App {
                     && *open == sha
                 {
                     *shown = Some(result.unwrap_or_else(|error| error));
+                }
+            }
+            Message::PrCommits { number, result } => {
+                if let Some(pr) = &mut self.pr
+                    && pr.summary.number == number
+                {
+                    pr.commits = Some(result);
+                }
+            }
+            Message::PrTimeline { number, result } => {
+                if let Some(pr) = &mut self.pr
+                    && pr.summary.number == number
+                {
+                    pr.timeline = Some(result);
                 }
             }
             Message::Log { job_id, result, .. } => {
@@ -1658,6 +1705,56 @@ mod tests {
             assert!(app.compose.is_none());
             assert_eq!(app.status, "Committed 01234567");
             assert_eq!(app.jobs.len(), 2, "history and changes reload");
+        }
+    }
+
+    #[test]
+    fn commits_and_timeline_load_once_when_their_tab_opens() {
+        for by_click in [false, true] {
+            let mut app = open_pr(PrTab::Summary);
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::PrTab(PrTab::Commits));
+            } else {
+                press(&mut app, KeyCode::Char('h'));
+            }
+            assert_eq!(
+                app.jobs,
+                vec![Job::LoadPrCommits {
+                    repo: "o/a".into(),
+                    number: 1
+                }]
+            );
+            app.jobs.clear();
+            app.receive(Message::PrCommits {
+                number: 1,
+                result: Ok(vec![PrCommit {
+                    oid: "c".repeat(40),
+                    headline: "First change".into(),
+                    author: "alice".into(),
+                    date: "2026-10-27T10:00:00Z".into(),
+                    checks: crate::model::Checks::Passing,
+                }]),
+            });
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("✓ cccccccc First change"), "{screen}");
+            press(&mut app, KeyCode::Char('t'));
+            app.receive(Message::PrTimeline {
+                number: 1,
+                result: Ok(vec![Event {
+                    at: "2026-10-27T10:00:00Z".into(),
+                    actor: "bob".into(),
+                    text: "added the label bug".into(),
+                }]),
+            });
+            assert!(
+                draw(&mut app, 140)
+                    .join("\n")
+                    .contains("bob added the label bug")
+            );
+            app.jobs.clear();
+            press(&mut app, KeyCode::Char('h'));
+            assert!(app.jobs.is_empty(), "the commits are not read again");
         }
     }
 

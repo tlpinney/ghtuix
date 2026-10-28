@@ -281,6 +281,16 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
             Job::LoadMerged => {
                 Message::Merged(client().and_then(|c| github::inbox::merged(&c).map_err(text)))
             }
+            Job::LoadPrCommits { repo, number } => Message::PrCommits {
+                number,
+                result: client()
+                    .and_then(|c| github::history::commits(&c, &repo, number).map_err(text)),
+            },
+            Job::LoadPrTimeline { repo, number } => Message::PrTimeline {
+                number,
+                result: client()
+                    .and_then(|c| github::history::timeline(&c, &repo, number).map_err(text)),
+            },
             Job::LoadLog {
                 repo,
                 job_id,

@@ -1,7 +1,7 @@
 //! The PR view: one pull request in tabs, drawn as scrollable lines.
 
 use crate::app::Action;
-use crate::model::{Checks, Entry, PrPage, PullRequest};
+use crate::model::{Checks, Entry, Event, PrCommit, PrPage, PullRequest};
 use crate::time;
 use ratatui::{
     Frame,
@@ -15,16 +15,20 @@ use ratatui::{
 pub enum PrTab {
     Summary,
     Conversation,
+    Commits,
     Files,
     Checks,
+    Timeline,
 }
 
 impl PrTab {
-    pub const ALL: [(PrTab, char, &'static str); 4] = [
+    pub const ALL: [(PrTab, char, &'static str); 6] = [
         (PrTab::Summary, 'o', "Summary"),
         (PrTab::Conversation, 'c', "Conversation"),
+        (PrTab::Commits, 'h', "Commits"),
         (PrTab::Files, 'f', "Files"),
         (PrTab::Checks, 'k', "Checks"),
+        (PrTab::Timeline, 't', "Timeline"),
     ];
 }
 
@@ -44,6 +48,10 @@ pub struct PrView {
     pub summary: PullRequest,
     pub page: Option<PrPage>,
     pub diff: Option<String>,
+    /// Read when the Commits tab first shows.
+    pub commits: Option<Result<Vec<PrCommit>, String>>,
+    /// Read when the Timeline tab first shows.
+    pub timeline: Option<Result<Vec<Event>, String>>,
     pub loading: bool,
     pub diff_loading: bool,
     pub error: Option<String>,
@@ -59,6 +67,8 @@ impl PrView {
             summary,
             page: None,
             diff: None,
+            commits: None,
+            timeline: None,
             loading: true,
             diff_loading: false,
             error: None,
@@ -219,6 +229,8 @@ impl PrView {
             PrTab::Conversation => conversation(page),
             PrTab::Files => files(page, self.diff.as_deref(), self.diff_loading),
             PrTab::Checks => checks(page),
+            PrTab::Commits => (commits(self.commits.as_ref()), Vec::new()),
+            PrTab::Timeline => (timeline(self.timeline.as_ref()), Vec::new()),
         }
     }
 }
@@ -343,6 +355,67 @@ fn files(
         None => lines.push(Line::raw("The diff is not loaded. Press r to load it.")),
     }
     (lines, anchors)
+}
+
+fn commits(commits: Option<&Result<Vec<PrCommit>, String>>) -> Vec<Line<'static>> {
+    let commits = match commits {
+        None => return vec![Line::raw("Loading commits…")],
+        Some(Err(error)) => return vec![Line::raw(error.clone())],
+        Some(Ok(commits)) => commits,
+    };
+    let mut lines = vec![bold(format!("{} commits, oldest first", commits.len()))];
+    for commit in commits {
+        let (mark, color) = check_mark(commit.checks);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{mark} "), Style::default().fg(color)),
+            Span::styled(
+                commit.oid.chars().take(8).collect::<String>(),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw(format!(" {}", commit.headline)),
+            Span::styled(
+                format!("  {} {}", commit.author, time::age(&commit.date)),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn timeline(events: Option<&Result<Vec<Event>, String>>) -> Vec<Line<'static>> {
+    let events = match events {
+        None => return vec![Line::raw("Loading the timeline…")],
+        Some(Err(error)) => return vec![Line::raw(error.clone())],
+        Some(Ok(events)) => events,
+    };
+    if events.is_empty() {
+        return vec![Line::raw("Nothing has happened yet")];
+    }
+    events
+        .iter()
+        .map(|event| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>4} ", time::age(&event.at)),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    event.actor.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {}", event.text)),
+            ])
+        })
+        .collect()
+}
+
+fn check_mark(state: Checks) -> (&'static str, Color) {
+    match state {
+        Checks::Passing => ("✓", Color::Green),
+        Checks::Failing => ("✗", Color::Red),
+        Checks::Pending => ("•", Color::Yellow),
+        Checks::None => (" ", Color::Reset),
+    }
 }
 
 fn checks(page: &PrPage) -> (Vec<Line<'static>>, Vec<(usize, Anchor)>) {

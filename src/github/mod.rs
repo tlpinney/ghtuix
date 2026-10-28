@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod actions;
 pub mod budget;
+pub mod history;
 pub mod inbox;
 pub mod pr;
 pub mod viewer;

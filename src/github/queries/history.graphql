@@ -1,0 +1,191 @@
+# A PR's commits, read when the Commits tab opens.
+query PrCommits($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          commit {
+            oid
+            messageHeadline
+            committedDate
+            author {
+              name
+              user {
+                login
+              }
+            }
+            statusCheckRollup {
+              state
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# A PR's timeline, read when the Timeline tab opens.
+query PrTimeline($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      timelineItems(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          __typename
+          ... on PullRequestCommit {
+            commit {
+              oid
+              messageHeadline
+              committedDate
+              author {
+                name
+                user {
+                  login
+                }
+              }
+            }
+          }
+          ... on HeadRefForcePushedEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+            afterCommit {
+              oid
+            }
+          }
+          ... on PullRequestReview {
+            createdAt
+            state
+            author {
+              __typename
+              login
+            }
+          }
+          ... on IssueComment {
+            createdAt
+            author {
+              __typename
+              login
+            }
+          }
+          ... on ReviewRequestedEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+            requestedReviewer {
+              __typename
+              ... on User {
+                login
+              }
+              ... on Bot {
+                login
+              }
+              ... on Team {
+                combinedSlug
+              }
+            }
+          }
+          ... on ReviewDismissedEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+          }
+          ... on LabeledEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+            label {
+              name
+            }
+          }
+          ... on UnlabeledEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+            label {
+              name
+            }
+          }
+          ... on RenamedTitleEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+            previousTitle
+            currentTitle
+          }
+          ... on AssignedEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+            assignee {
+              __typename
+              ... on User {
+                login
+              }
+              ... on Bot {
+                login
+              }
+            }
+          }
+          ... on ReadyForReviewEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+          }
+          ... on ConvertToDraftEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+          }
+          ... on ClosedEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+          }
+          ... on ReopenedEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+          }
+          ... on MergedEvent {
+            createdAt
+            actor {
+              __typename
+              login
+            }
+            mergeRefName
+          }
+        }
+      }
+    }
+  }
+}
