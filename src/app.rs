@@ -57,7 +57,11 @@ pub struct App {
     pub view: View,
     pub inbox: Inbox,
     pub login: Option<String>,
+    /// The account the cached Inbox belongs to, until sign-in confirms it.
+    cached_login: Option<String>,
     pub status: String,
+    /// A rate-limit warning from the GitHub client, shown beside the status.
+    pub api_note: Option<String>,
     pub quit: bool,
     /// Jobs requested since the event loop last looked.
     pub jobs: Vec<Job>,
@@ -71,7 +75,9 @@ impl Default for App {
             view: View::Inbox,
             inbox: Inbox::default(),
             login: None,
+            cached_login: None,
             status: "Signing in…".into(),
+            api_note: None,
             quit: false,
             jobs: vec![Job::SignIn],
             hits: Vec::new(),
@@ -113,6 +119,14 @@ impl App {
         }
     }
 
+    /// Shows `login`'s cached Inbox (saved at `saved_at`) until sign-in and a refresh.
+    pub fn restore(&mut self, login: String, prs: Vec<PullRequest>, saved_at: i64) {
+        self.inbox.open.prs = Some(prs);
+        self.inbox.open.fetched_at = Some(saved_at);
+        self.inbox.open.cached = true;
+        self.cached_login = Some(login);
+    }
+
     /// Queues a list load unless one is already running.
     fn load(&mut self, job: Job) {
         let list = match job {
@@ -128,6 +142,15 @@ impl App {
     pub fn receive(&mut self, message: Message) {
         match message {
             Message::SignedIn(Ok(login)) => {
+                // Another account's cached data is never shown under this one.
+                if self
+                    .cached_login
+                    .take()
+                    .is_some_and(|cached| cached != login)
+                {
+                    self.inbox.open = Default::default();
+                    self.inbox.merged = Default::default();
+                }
                 self.status = format!("Signed in as @{login}");
                 self.login = Some(login);
                 self.load(Job::LoadInbox);
@@ -224,7 +247,11 @@ impl App {
                 Vec::new()
             }
         };
-        frame.render_widget(Paragraph::new(format!(" {}", self.status)), status);
+        let note = self
+            .api_note
+            .as_deref()
+            .map_or(String::new(), |note| format!("  •  {note}"));
+        frame.render_widget(Paragraph::new(format!(" {}{note}", self.status)), status);
         hits.extend(keybar::draw(frame, bar, &self.controls()));
         self.hits = hits;
     }
@@ -274,6 +301,33 @@ mod tests {
         ])));
         app.jobs.clear();
         app
+    }
+
+    #[test]
+    fn a_cached_inbox_shows_at_once_and_only_for_its_own_account() {
+        let mut app = App::default();
+        app.restore("octocat".into(), vec![pr(1, "o/a", &[Queue::Authored])], 0);
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(
+            screen.contains("o/a#1") && screen.contains("refreshing"),
+            "{screen}"
+        );
+        app.receive(Message::SignedIn(Ok("octocat".into())));
+        assert_eq!(
+            app.inbox.visible().len(),
+            1,
+            "same account keeps the cached list"
+        );
+        app.receive(Message::Inbox(Ok(vec![])));
+        assert!(!app.inbox.open.cached);
+
+        let mut other = App::default();
+        other.restore("octocat".into(), vec![pr(1, "o/a", &[])], 0);
+        other.receive(Message::SignedIn(Ok("hubot".into())));
+        assert!(
+            other.inbox.open.prs.is_none(),
+            "another account's cache is dropped"
+        );
     }
 
     #[test]

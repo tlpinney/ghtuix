@@ -6,7 +6,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use graphql_client::{GraphQLQuery, QueryBody, Response};
 use std::process::Command;
+use std::sync::Arc;
 
+pub mod budget;
 pub mod inbox;
 pub mod viewer;
 
@@ -16,6 +18,8 @@ pub struct Client {
     graphql_url: String,
     token: String,
     agent: ureq::Agent,
+    /// Rate-limit budget and request slots, shared by every clone.
+    gate: Arc<budget::Gate>,
 }
 
 impl Client {
@@ -32,12 +36,22 @@ impl Client {
             graphql_url: graphql_url(host),
             token,
             agent,
+            gate: Arc::default(),
         })
+    }
+
+    /// The rate-limit budget GitHub last reported.
+    pub fn budget(&self) -> budget::Budget {
+        self.gate.budget()
     }
 
     /// Runs one GraphQL query or mutation and returns its typed data.
     pub fn graphql<Q: GraphQLQuery>(&self, variables: Q::Variables) -> Result<Q::ResponseData> {
         let body: QueryBody<Q::Variables> = Q::build_query(variables);
+        let _slot = self
+            .gate
+            .enter(crate::time::now())
+            .map_err(|refused| anyhow!(refused))?;
         let mut response = self
             .agent
             .post(&self.graphql_url)
@@ -45,6 +59,12 @@ impl Client {
             .send_json(&body)
             .with_context(|| format!("Could not reach {}", self.graphql_url))?;
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        self.gate.observe(
+            status,
+            |name| Some(headers.get(name)?.to_str().ok()?.to_owned()),
+            crate::time::now(),
+        );
         let text = response.body_mut().read_to_string()?;
         if !(200..300).contains(&status) {
             bail!("GitHub returned HTTP {status}: {}", http_message(&text));

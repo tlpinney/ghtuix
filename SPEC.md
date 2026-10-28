@@ -58,6 +58,27 @@ A local SQLite database (`rusqlite`, bundled) holds what can be reused:
 
 Cached private data is keyed by host and account, and dropped when the account changes.
 
+## API budget
+
+GitHub allows 5,000 GraphQL points an hour per user, at most 2,000 points a minute and
+100 concurrent requests, and REST search 30 requests a minute
+([GraphQL limits](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api),
+[REST limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api),
+[best practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)).
+`github/budget.rs` follows them:
+
+- **Read the budget from every response** (`x-ratelimit-*` headers); nothing extra is
+  requested.
+- **Back off early.** Below 20 % left, automatic refresh slows to 5 minutes; below 5 %, it
+  waits for the reset. Manual refresh still works. The status line says why.
+- **Obey `retry-after`.** A 403/429 with `retry-after`, or with nothing remaining, blocks
+  every request until GitHub's time; nothing is sent meanwhile.
+- **At most 4 requests in flight**; more wait their turn. Writes (later) go one at a time,
+  at least a second apart, as GitHub asks.
+- **Pull strategically.** The Inbox is one aliased query (measured: 6 points, ~360 an hour
+  at one refresh a minute). PR pages load per tab when opened and are skipped when
+  `updatedAt` is unchanged. Search goes through GraphQL, not the 30/minute REST search.
+
 ## Testing
 
 - Unit tests for parsing, state transitions and layout (render into a `TestBackend`).

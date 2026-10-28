@@ -1,7 +1,9 @@
 //! The app's own types, independent of the GitHub API shapes.
 
+use serde::{Deserialize, Serialize};
+
 /// Which Inbox queue a pull request came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Queue {
     Authored,
     Assigned,
@@ -9,7 +11,7 @@ pub enum Queue {
 }
 
 /// GitHub's review decision for a pull request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     Approved,
     ChangesRequested,
@@ -18,7 +20,7 @@ pub enum Decision {
 }
 
 /// The head commit's combined check state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Checks {
     Passing,
     Failing,
@@ -27,7 +29,7 @@ pub enum Checks {
 }
 
 /// Where someone stands on a pull request, most significant first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Stance {
     ChangesRequested,
     Approved,
@@ -51,19 +53,19 @@ impl Stance {
 }
 
 /// A GitHub user, bot or team (a team's login is `org/slug`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Person {
     pub login: String,
     pub bot: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reviewer {
     pub person: Person,
     pub stance: Stance,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
     pub repo: String,
     pub number: i64,

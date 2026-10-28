@@ -49,6 +49,8 @@ pub struct Loaded {
     pub loading: bool,
     pub error: Option<String>,
     pub fetched_at: Option<i64>,
+    /// The list came from the local cache and has not been refreshed yet.
+    pub cached: bool,
 }
 
 impl Loaded {
@@ -59,6 +61,7 @@ impl Loaded {
                 self.prs = Some(prs);
                 self.error = None;
                 self.fetched_at = Some(time::now());
+                self.cached = false;
             }
             Err(error) => self.error = Some(error),
         }
@@ -195,7 +198,10 @@ impl Inbox {
             .map(|(tab, _, label)| format!("{label} {}", self.count(*tab)))
             .collect::<Vec<_>>()
             .join(" · ");
-        let state = if source.loading {
+        let state = if source.cached {
+            let age = source.fetched_at.map_or("?".into(), time::age_at_seconds);
+            format!("cached {age} ago, refreshing…")
+        } else if source.loading {
             "loading…".to_string()
         } else if let Some(error) = &source.error {
             error.clone()

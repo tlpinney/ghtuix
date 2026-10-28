@@ -1,0 +1,219 @@
+//! GitHub's rate limits, as every response reports them, and the client's request gate.
+//!
+//! Each response carries `x-ratelimit-remaining`/`-limit`/`-reset`. A 403 or 429 with
+//! `retry-after` (a secondary limit) or with nothing remaining blocks every request until
+//! GitHub says to resume. At most [`MAX_IN_FLIGHT`] requests run at once; the rest wait.
+
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
+
+/// Concurrent requests per client (GitHub allows 100; a TUI never needs more than a few).
+pub const MAX_IN_FLIGHT: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Budget {
+    pub limit: u32,
+    pub remaining: u32,
+    /// When the hourly budget resets (Unix seconds).
+    pub reset_at: i64,
+    /// No request is sent before this time (Unix seconds).
+    pub blocked_until: Option<i64>,
+}
+
+impl Budget {
+    /// Updates from one response's status and headers (`header` looks one up by name).
+    pub fn observe(&mut self, status: u16, header: impl Fn(&str) -> Option<String>, now: i64) {
+        let number = |name: &str| header(name)?.trim().parse::<i64>().ok();
+        if let (Some(limit), Some(remaining)) =
+            (number("x-ratelimit-limit"), number("x-ratelimit-remaining"))
+        {
+            self.limit = limit.max(0) as u32;
+            self.remaining = remaining.max(0) as u32;
+        }
+        if let Some(reset) = number("x-ratelimit-reset") {
+            self.reset_at = reset;
+        }
+        if matches!(status, 403 | 429) {
+            if let Some(after) = number("retry-after") {
+                self.blocked_until = Some(now + after.max(1));
+            } else if self.limit > 0 && self.remaining == 0 {
+                self.blocked_until = Some(self.reset_at.max(now + 1));
+            }
+        }
+    }
+
+    pub fn blocked(&self, now: i64) -> Option<i64> {
+        self.blocked_until.filter(|until| *until > now)
+    }
+
+    fn fraction_left(&self) -> f64 {
+        if self.limit == 0 {
+            1.0
+        } else {
+            f64::from(self.remaining) / f64::from(self.limit)
+        }
+    }
+
+    /// How long automatic refresh waits: `normal` while the budget is healthy, 5 minutes
+    /// below 20 % left, and until the reset below 5 % or while blocked.
+    pub fn refresh_interval(&self, normal: Duration, now: i64) -> Duration {
+        let until = |at: i64| Duration::from_secs((at - now).max(1) as u64);
+        if let Some(blocked) = self.blocked(now) {
+            until(blocked)
+        } else if self.fraction_left() < 0.05 && self.reset_at > now {
+            until(self.reset_at)
+        } else if self.fraction_left() < 0.2 {
+            normal.max(Duration::from_secs(300))
+        } else {
+            normal
+        }
+    }
+
+    /// A status note when the budget needs attention, else `None`.
+    pub fn note(&self, now: i64) -> Option<String> {
+        if let Some(until) = self.blocked(now) {
+            return Some(format!(
+                "GitHub rate limit reached • requests resume in {}",
+                wait(until - now)
+            ));
+        }
+        (self.fraction_left() < 0.2).then(|| {
+            format!(
+                "GitHub API budget low: {}/{} left, resets in {} • auto-refresh slowed",
+                self.remaining,
+                self.limit,
+                wait(self.reset_at - now)
+            )
+        })
+    }
+}
+
+fn wait(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 120 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m", seconds / 60)
+    }
+}
+
+/// Shared by every clone of a client: the budget and the in-flight count.
+#[derive(Debug, Default)]
+pub struct Gate {
+    state: Mutex<(Budget, usize)>,
+    freed: Condvar,
+}
+
+impl Gate {
+    /// Waits for a free slot; refuses at once while GitHub has asked to wait.
+    pub fn enter(&self, now: i64) -> Result<Slot<'_>, String> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(until) = state.0.blocked(now) {
+            return Err(format!(
+                "GitHub rate limit reached • not sent; requests resume in {}",
+                wait(until - now)
+            ));
+        }
+        while state.1 >= MAX_IN_FLIGHT {
+            state = self.freed.wait(state).unwrap();
+        }
+        state.1 += 1;
+        Ok(Slot { gate: self })
+    }
+
+    pub fn budget(&self) -> Budget {
+        self.state.lock().unwrap().0
+    }
+
+    pub fn observe(&self, status: u16, header: impl Fn(&str) -> Option<String>, now: i64) {
+        self.state.lock().unwrap().0.observe(status, header, now);
+    }
+}
+
+/// One request's place in the gate, released when dropped.
+#[derive(Debug)]
+pub struct Slot<'a> {
+    gate: &'a Gate,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.gate.state.lock().unwrap().1 -= 1;
+        self.gate.freed.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn a_healthy_budget_changes_nothing() {
+        let mut budget = Budget::default();
+        let ok = [
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "4900"),
+        ];
+        budget.observe(200, headers(&ok), 0);
+        assert_eq!(budget.remaining, 4900);
+        assert_eq!(budget.note(0), None);
+        let normal = Duration::from_secs(60);
+        assert_eq!(budget.refresh_interval(normal, 0), normal);
+    }
+
+    #[test]
+    fn a_low_budget_slows_refresh_and_an_empty_one_waits_for_the_reset() {
+        let mut budget = Budget::default();
+        let low = [
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "600"),
+            ("x-ratelimit-reset", "3600"),
+        ];
+        budget.observe(200, headers(&low), 0);
+        let normal = Duration::from_secs(60);
+        assert_eq!(budget.refresh_interval(normal, 0), Duration::from_secs(300));
+        assert!(budget.note(0).unwrap().contains("600/5000"));
+        let empty = [
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "3600"),
+        ];
+        budget.observe(403, headers(&empty), 0);
+        assert_eq!(budget.blocked(0), Some(3600));
+        assert_eq!(
+            budget.refresh_interval(normal, 0),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn retry_after_blocks_the_gate_until_it_passes() {
+        let gate = Gate::default();
+        gate.observe(429, headers(&[("retry-after", "30")]), 100);
+        assert!(gate.enter(110).unwrap_err().contains("resume in 20s"));
+        assert!(gate.enter(131).is_ok());
+    }
+
+    #[test]
+    fn the_gate_holds_at_most_max_in_flight() {
+        let gate = std::sync::Arc::new(Gate::default());
+        let slots: Vec<_> = (0..MAX_IN_FLIGHT).map(|_| gate.enter(0).unwrap()).collect();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || gate.enter(0).map(|_| ()).is_ok())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "the fifth request waits");
+        drop(slots);
+        assert!(waiter.join().unwrap());
+    }
+}
