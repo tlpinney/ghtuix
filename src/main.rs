@@ -306,6 +306,18 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 repo,
                 run_id,
             },
+            Job::GitWrite(repo, op) => {
+                let commit = matches!(op, app::GitOp::Commit(_));
+                let result = match op {
+                    app::GitOp::Stage(path) => repo.stage(&path).map(|()| String::new()),
+                    app::GitOp::Unstage(path) => repo.unstage(&path).map(|()| String::new()),
+                    app::GitOp::Commit(message) => repo.commit(&message),
+                };
+                Message::GitDone {
+                    commit,
+                    result: result.map_err(text),
+                }
+            }
             Job::LoadHistory(repo) => Message::History(repo.history(500).map_err(text)),
             Job::LoadChanges(repo) => Message::Changes(
                 repo.status()
@@ -314,6 +326,7 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                             status,
                             working: repo.working_diff()?,
                             staged: repo.staged_diff()?,
+                            author: repo.author().unwrap_or_else(|_| "unknown".into()),
                         })
                     })
                     .map_err(text),

@@ -109,6 +109,9 @@ pub fn publish(
             .filter(|pr| pr.merged)
             .map(|pr| pr.url)
             .ok_or_else(missing),
+        WriteKind::Commit { .. } => {
+            anyhow::bail!("A commit is a local write and never goes to GitHub")
+        }
         WriteKind::Rerun { repo, run_id, .. } => {
             super::actions::rerun_failed(client, repo, *run_id)
                 .map(|()| "re-run requested".to_string())

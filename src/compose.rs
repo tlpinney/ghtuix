@@ -116,6 +116,9 @@ impl Compose {
                 format!("Re-run the failed jobs of {run} in {repo}")
             }
             WriteKind::CancelRun { run, repo, .. } => format!("Cancel {run} in {repo}"),
+            WriteKind::Commit { branch, files, .. } => {
+                format!("Commit {} staged file(s) on {branch} in", files.len())
+            }
         };
         let short = self.target.head_oid.chars().take(12).collect::<String>();
         let mut lines = vec![
@@ -126,7 +129,13 @@ impl Compose {
             Line::raw(self.target.title.clone()),
             Line::raw(format!("As @{login}")),
         ];
-        if let WriteKind::Merge { method } = &self.kind {
+        if let WriteKind::Commit { author, files, .. } = &self.kind {
+            // A local commit: git's own author identity, not the GitHub account.
+            lines[2] = Line::raw(format!("As {author}"));
+            for file in files {
+                lines.push(Line::raw(format!("  {file}")));
+            }
+        } else if let WriteKind::Merge { method } = &self.kind {
             lines[0] = Line::styled(
                 format!(
                     "Merge {} into {} by {}",

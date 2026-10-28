@@ -18,7 +18,10 @@ spec disagree, this spec wins.
 3. **Writes** — comment, approve, request changes, reply to a review thread. Every write
    shows a preview of exactly what will be sent and needs an explicit confirm.
 4. **Local Git** — History (commit graph), Working and Staged diffs for the current checkout.
-   Read-only browsing never changes the working tree, index, refs or config.
+   Read-only browsing never changes the working tree, index, refs or config. Staging and
+   unstaging a file (`+`/`-`) happen at once, since they are easy to undo and the file
+   visibly moves between lists; a commit (`K`) shows a preview of the branch, author,
+   staged files and message first. Git writes live in one function in `git.rs`.
 
 Later (not v1): Actions runs and logs, local Git operations (stage, commit, branch),
 search, notifications, dashboard.

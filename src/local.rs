@@ -32,6 +32,8 @@ pub struct Changes {
     pub status: Status,
     pub working: String,
     pub staged: String,
+    /// Who a commit would be recorded as (`Name <email>`).
+    pub author: String,
 }
 
 pub struct Local {
@@ -46,6 +48,8 @@ pub struct Local {
     pub commit: Option<(String, Option<String>)>,
     pub scroll: u16,
     pub loading: bool,
+    /// The selected file of the Working or Staged list.
+    pub file: usize,
 }
 
 impl Local {
@@ -59,6 +63,7 @@ impl Local {
             commit: None,
             scroll: 0,
             loading: false,
+            file: 0,
         }
     }
 
@@ -89,6 +94,25 @@ impl Local {
             Some(Ok(lines)) => Some(lines.get(self.selected)?.commit.as_ref()?.sha.clone()),
             _ => None,
         }
+    }
+
+    /// The files the Working or Staged tab lists.
+    pub fn files(&self) -> &[(String, char)] {
+        match &self.changes {
+            Some(Ok(changes)) if self.tab == LocalTab::Staged => &changes.status.staged,
+            Some(Ok(changes)) => &changes.status.unstaged,
+            _ => &[],
+        }
+    }
+
+    pub fn selected_file(&self) -> Option<&(String, char)> {
+        self.files().get(self.file)
+    }
+
+    /// Selects file `index`, showing its diff from the top.
+    pub fn select_file(&mut self, index: usize) {
+        self.file = index.min(self.files().len().saturating_sub(1));
+        self.scroll = 0;
     }
 
     pub fn scroll_by(&mut self, delta: isize) {
@@ -123,6 +147,16 @@ impl Local {
         self.scroll = self
             .scroll
             .min((lines.len() as u16).saturating_sub(inner.height));
+        // File rows start two lines down (under the branch line and a blank).
+        if self.commit.is_none() {
+            for index in 0..self.files().len() {
+                let row = (2 + index) as u16;
+                if (self.scroll..self.scroll + inner.height).contains(&row) {
+                    let rect = Rect::new(inner.x, inner.y + row - self.scroll, inner.width, 1);
+                    hits.push((rect, Action::Select(index)));
+                }
+            }
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -248,11 +282,28 @@ impl Local {
             lines.push(Line::raw(empty));
             return lines;
         }
-        for (path, code) in files {
-            lines.push(Line::raw(format!("  {code} {path}")));
+        for (index, (path, code)) in files.iter().enumerate() {
+            let line = Line::raw(format!("  {code} {path}"));
+            lines.push(if index == self.file {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            });
         }
         lines.push(Line::raw(""));
-        lines.extend(crate::diff::lines(diff));
+        // Only the selected file's diff, cut from the whole one already read.
+        if let Some((path, code)) = files.get(self.file) {
+            let one = crate::git::diff_of(diff, path);
+            if one.is_empty() {
+                let what = if *code == '?' {
+                    "New file"
+                } else {
+                    "No text diff for"
+                };
+                lines.push(Line::raw(format!("{what} {path}")));
+            }
+            lines.extend(crate::diff::lines(&one));
+        }
         lines
     }
 }
@@ -312,7 +363,8 @@ pub(crate) mod tests {
                 unstaged: vec![],
             },
             working: String::new(),
-            staged: "+new".into(),
+            staged: "diff --git a/a.rs b/a.rs\n+new".into(),
+            author: "T <t@x>".into(),
         }));
         local.tab = LocalTab::Working;
         let text: Vec<String> = local.lines().iter().map(|l| l.to_string()).collect();

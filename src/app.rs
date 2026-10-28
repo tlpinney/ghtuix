@@ -59,6 +59,12 @@ pub enum Action {
     OpenLog,
     /// Jump to the next (`1`) or previous (`-1`) failure in the open log.
     Failure(isize),
+    /// Stage the selected file of the Working list.
+    Stage,
+    /// Unstage the selected file of the Staged list.
+    Unstage,
+    /// Write a commit message for what is staged.
+    StartCommit,
     /// Re-run the failed jobs of the open workflow run.
     Rerun,
     /// Cancel the open workflow run.
@@ -112,6 +118,11 @@ pub enum Message {
         finished: bool,
         result: Result<String, String>,
     },
+    /// A local git write finished; for a commit, the new commit's id.
+    GitDone {
+        commit: bool,
+        result: Result<String, String>,
+    },
     /// A write finished: the new comment's or review's URL, or why it failed.
     Written(Result<String, String>),
     /// The diff between two commits of an open PR.
@@ -156,6 +167,8 @@ pub enum Job {
         run_id: i64,
         saved: Option<Saved>,
     },
+    /// Change the local checkout: stage, unstage or commit.
+    GitWrite(Repo, GitOp),
     LoadHistory(Repo),
     LoadChanges(Repo),
     ShowCommit(Repo, String),
@@ -166,6 +179,14 @@ pub enum Job {
         body: String,
     },
     Open(String),
+}
+
+/// A local git write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitOp {
+    Stage(String),
+    Unstage(String),
+    Commit(String),
 }
 
 pub struct App {
@@ -249,6 +270,54 @@ impl App {
                 self.local.commit = None;
                 self.local.scroll = 0;
             }
+            Action::Select(index)
+                if self.view == View::Local && self.local.tab != LocalTab::History =>
+            {
+                self.local.select_file(index);
+            }
+            Action::Move(delta)
+                if self.view == View::Local && self.local.tab != LocalTab::History =>
+            {
+                // Arrows move between files; paging and the wheel scroll the diff.
+                if delta.abs() == 1 && self.local.commit.is_none() {
+                    self.local
+                        .select_file(self.local.file.saturating_add_signed(delta));
+                } else {
+                    self.local.scroll_by(delta);
+                }
+            }
+            Action::Stage | Action::Unstage => {
+                if let (Ok(repo), Some((path, _))) = (&self.local.repo, self.local.selected_file())
+                {
+                    let op = if action == Action::Stage {
+                        GitOp::Stage(path.clone())
+                    } else {
+                        GitOp::Unstage(path.clone())
+                    };
+                    self.jobs.push(Job::GitWrite(repo.clone(), op));
+                }
+            }
+            Action::StartCommit => match &self.local.changes {
+                Some(Ok(changes)) if !changes.status.staged.is_empty() => {
+                    let root = self
+                        .local
+                        .repo
+                        .as_ref()
+                        .map_or(String::new(), |repo| repo.root.display().to_string());
+                    let kind = WriteKind::Commit {
+                        branch: changes.status.branch.clone(),
+                        author: changes.author.clone(),
+                        files: changes
+                            .status
+                            .staged
+                            .iter()
+                            .map(|(path, code)| format!("{code} {path}"))
+                            .collect(),
+                    };
+                    self.compose = Some(Compose::new(kind, Target::run(&root, "")));
+                }
+                _ => self.status = "Nothing is staged to commit; + stages a file".into(),
+            },
             Action::Select(index) if self.view == View::Local => {
                 if index == self.local.selected {
                     self.dispatch(Action::Open);
@@ -462,6 +531,14 @@ impl App {
                 {
                     compose.stage = Stage::Sending;
                     compose.error = None;
+                    if matches!(compose.kind, WriteKind::Commit { .. }) {
+                        if let Ok(repo) = &self.local.repo {
+                            let message = compose.editor.text();
+                            self.jobs
+                                .push(Job::GitWrite(repo.clone(), GitOp::Commit(message)));
+                        }
+                        return;
+                    }
                     self.jobs.push(Job::Write {
                         kind: compose.kind.clone(),
                         pr_id: compose.target.pr_id.clone(),
@@ -707,6 +784,25 @@ impl App {
                     log.load(result);
                 }
             }
+            Message::GitDone { commit, result } => {
+                match (&result, commit) {
+                    (Ok(sha), true) => {
+                        self.compose = None;
+                        self.status = format!("Committed {}", &sha[..sha.len().min(8)]);
+                    }
+                    (Err(error), true) => {
+                        if let Some(compose) = &mut self.compose {
+                            compose.stage = Stage::Preview;
+                            compose.error = Some(error.clone());
+                        }
+                    }
+                    (Err(error), false) => self.status = error.clone(),
+                    (Ok(_), false) => {}
+                }
+                // Status, diffs and (after a commit) history all changed.
+                self.local.loading = false;
+                self.load_local();
+            }
             Message::Written(Ok(url)) => {
                 let kind = self.compose.take().map(|c| c.kind);
                 let label = kind.as_ref().map_or("Write".into(), WriteKind::label);
@@ -944,6 +1040,17 @@ impl App {
                 controls.push(Control::hidden(KeyCode::Esc, Action::Back));
             } else if self.local.tab == LocalTab::History {
                 controls.push(Control::new(KeyCode::Enter, "Show commit", Action::Open));
+            } else {
+                if self.local.tab == LocalTab::Working {
+                    controls.push(Control::new(KeyCode::Char('+'), "Stage", Action::Stage));
+                } else {
+                    controls.push(Control::new(KeyCode::Char('-'), "Unstage", Action::Unstage));
+                }
+                controls.push(Control::new(
+                    KeyCode::Char('K'),
+                    "Commit",
+                    Action::StartCommit,
+                ));
             }
             controls.extend(
                 LocalTab::ALL.iter().map(|(tab, key, _)| {
@@ -1475,6 +1582,82 @@ mod tests {
                     ..
                 }]
             ));
+        }
+    }
+
+    #[test]
+    fn files_stage_by_key_or_click_and_commit_through_a_preview() {
+        use crate::git::Status;
+        for by_click in [false, true] {
+            let repo = Repo {
+                root: "/tmp/repo".into(),
+            };
+            let mut app = App {
+                local: Local::new(Ok(repo.clone())),
+                jobs: Vec::new(),
+                ..App::default()
+            };
+            press(&mut app, KeyCode::Char('2'));
+            press(&mut app, KeyCode::Char('w'));
+            app.jobs.clear();
+            app.receive(Message::Changes(Ok(Changes {
+                status: Status {
+                    branch: "main".into(),
+                    staged: vec![("done.rs".into(), 'M')],
+                    unstaged: vec![("a.rs".into(), 'M'), ("b.rs".into(), '?')],
+                    ..Status::default()
+                },
+                working: "diff --git a/a.rs b/a.rs\n+edit".into(),
+                staged: String::new(),
+                author: "Ada <ada@example.invalid>".into(),
+            })));
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(
+                screen.contains("+edit") && screen.contains("+ Stage"),
+                "{screen}"
+            );
+            if by_click {
+                click(&mut app, &Action::Select(1));
+            } else {
+                press(&mut app, KeyCode::Down);
+            }
+            assert!(draw(&mut app, 120).join("\n").contains("New file b.rs"));
+            if by_click {
+                click(&mut app, &Action::Stage);
+            } else {
+                press(&mut app, KeyCode::Char('+'));
+            }
+            assert_eq!(
+                app.jobs,
+                vec![Job::GitWrite(repo.clone(), GitOp::Stage("b.rs".into()))]
+            );
+            app.jobs.clear();
+            press(&mut app, KeyCode::Char('K'));
+            app.paste("Add b");
+            app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            let screen = draw(&mut app, 120).join("\n");
+            assert!(
+                screen.contains("Commit 1 staged file(s) on main"),
+                "{screen}"
+            );
+            assert!(screen.contains("As Ada <ada@example.invalid>"), "{screen}");
+            assert!(
+                screen.contains("M done.rs") && screen.contains("│ Add b"),
+                "{screen}"
+            );
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.jobs,
+                vec![Job::GitWrite(repo.clone(), GitOp::Commit("Add b".into()))]
+            );
+            app.jobs.clear();
+            app.receive(Message::GitDone {
+                commit: true,
+                result: Ok("0123456789abcdef".into()),
+            });
+            assert!(app.compose.is_none());
+            assert_eq!(app.status, "Committed 01234567");
+            assert_eq!(app.jobs.len(), 2, "history and changes reload");
         }
     }
 

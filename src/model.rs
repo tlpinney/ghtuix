@@ -121,6 +121,12 @@ pub enum WriteKind {
         run_id: i64,
         run: String,
     },
+    /// Commit the staged files of the local checkout (a local write, not GitHub).
+    Commit {
+        branch: String,
+        author: String,
+        files: Vec<String>,
+    },
 }
 
 impl WriteKind {
@@ -138,6 +144,7 @@ impl WriteKind {
             Self::Merge { method } => format!("Merge ({})", method.label().to_lowercase()),
             Self::Rerun { run, .. } => format!("Re-run failed jobs of {run}"),
             Self::CancelRun { run, .. } => format!("Cancel {run}"),
+            Self::Commit { branch, .. } => format!("Commit on {branch}"),
         }
     }
 
