@@ -121,6 +121,25 @@ pub enum WriteKind {
         run_id: i64,
         run: String,
     },
+    Close,
+    Reopen,
+    ToDraft,
+    Ready,
+    /// Rename the PR; the new title is the compose box's text.
+    Title {
+        from: String,
+    },
+    Labels {
+        add: Vec<Label>,
+        remove: Vec<Label>,
+    },
+    /// Request (or stop requesting) reviews from these logins.
+    Reviewers {
+        repo: String,
+        number: i64,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
     /// Commit the staged files of the local checkout (a local write, not GitHub).
     Commit {
         branch: String,
@@ -145,6 +164,13 @@ impl WriteKind {
             Self::Rerun { run, .. } => format!("Re-run failed jobs of {run}"),
             Self::CancelRun { run, .. } => format!("Cancel {run}"),
             Self::Commit { branch, .. } => format!("Commit on {branch}"),
+            Self::Close => "Close".into(),
+            Self::Reopen => "Reopen".into(),
+            Self::ToDraft => "Convert to draft".into(),
+            Self::Ready => "Ready for review".into(),
+            Self::Title { .. } => "Edit title".into(),
+            Self::Labels { .. } => "Labels".into(),
+            Self::Reviewers { .. } => "Reviewers".into(),
         }
     }
 
@@ -152,7 +178,16 @@ impl WriteKind {
     pub fn has_text(&self) -> bool {
         !matches!(
             self,
-            Self::Resolve { .. } | Self::Merge { .. } | Self::Rerun { .. } | Self::CancelRun { .. }
+            Self::Resolve { .. }
+                | Self::Merge { .. }
+                | Self::Rerun { .. }
+                | Self::CancelRun { .. }
+                | Self::Close
+                | Self::Reopen
+                | Self::ToDraft
+                | Self::Ready
+                | Self::Labels { .. }
+                | Self::Reviewers { .. }
         )
     }
 
@@ -160,6 +195,13 @@ impl WriteKind {
     pub fn body_optional(&self) -> bool {
         self == &Self::Approve || !self.has_text()
     }
+}
+
+/// A repository label (GitHub's node id and its name).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Label {
+    pub id: String,
+    pub name: String,
 }
 
 /// A GitHub user, bot or team (a team's login is `org/slug`).
@@ -309,6 +351,9 @@ pub struct PrPage {
     pub merge_state: String,
     /// The merge methods the repository allows.
     pub merge_methods: Vec<MergeMethod>,
+    pub labels: Vec<Label>,
+    /// Logins whose review is requested and not yet given.
+    pub requested: Vec<String>,
     pub decision: Decision,
     /// Comments and reviews, oldest first.
     pub conversation: Vec<Entry>,

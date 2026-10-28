@@ -1,0 +1,29 @@
+# What a picker offers, read when the picker opens.
+query RepoLabels($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    labels(first: 100, after: $after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        name
+      }
+    }
+  }
+}
+
+query Assignable($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    assignableUsers(first: 100, after: $after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        login
+      }
+    }
+  }
+}

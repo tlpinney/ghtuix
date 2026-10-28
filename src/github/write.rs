@@ -29,6 +29,13 @@ mutation!(MergePr);
 mutation!(ReplyToThread);
 mutation!(ResolveThread);
 mutation!(UnresolveThread);
+mutation!(ClosePr);
+mutation!(ReopenPr);
+mutation!(ToDraft);
+mutation!(ReadyForReview);
+mutation!(RenamePr);
+mutation!(AddLabels);
+mutation!(RemoveLabels);
 
 /// Publishes `kind` with `body` on the PR with node id `pr_id`. Reviews and line comments
 /// are pinned to `head_oid`, the head commit the user looked at. Returns the new item's URL,
@@ -141,5 +148,83 @@ pub fn publish(
             .filter(|thread| !thread.is_resolved)
             .map(|_| "thread unresolved".to_string())
             .ok_or_else(missing),
+        WriteKind::Close => client
+            .mutate::<ClosePr>(close_pr::Variables { pr: pr_id.into() })?
+            .close_pull_request
+            .and_then(|done| done.pull_request)
+            .map(|pr| pr.url)
+            .ok_or_else(missing),
+        WriteKind::Reopen => client
+            .mutate::<ReopenPr>(reopen_pr::Variables { pr: pr_id.into() })?
+            .reopen_pull_request
+            .and_then(|done| done.pull_request)
+            .map(|pr| pr.url)
+            .ok_or_else(missing),
+        WriteKind::ToDraft => client
+            .mutate::<ToDraft>(to_draft::Variables { pr: pr_id.into() })?
+            .convert_pull_request_to_draft
+            .and_then(|done| done.pull_request)
+            .map(|pr| pr.url)
+            .ok_or_else(missing),
+        WriteKind::Ready => client
+            .mutate::<ReadyForReview>(ready_for_review::Variables { pr: pr_id.into() })?
+            .mark_pull_request_ready_for_review
+            .and_then(|done| done.pull_request)
+            .map(|pr| pr.url)
+            .ok_or_else(missing),
+        WriteKind::Title { .. } => {
+            let title = new_title(body);
+            if title.is_empty() {
+                anyhow::bail!("A PR needs a title");
+            }
+            client
+                .mutate::<RenamePr>(rename_pr::Variables {
+                    pr: pr_id.into(),
+                    title,
+                })?
+                .update_pull_request
+                .and_then(|done| done.pull_request)
+                .map(|pr| pr.url)
+                .ok_or_else(missing)
+        }
+        WriteKind::Labels { add, remove } => {
+            let ids =
+                |labels: &[crate::model::Label]| labels.iter().map(|l| l.id.clone()).collect();
+            if !add.is_empty() {
+                client.mutate::<AddLabels>(add_labels::Variables {
+                    pr: pr_id.into(),
+                    labels: ids(add),
+                })?;
+            }
+            if !remove.is_empty() {
+                client.mutate::<RemoveLabels>(remove_labels::Variables {
+                    pr: pr_id.into(),
+                    labels: ids(remove),
+                })?;
+            }
+            Ok("labels changed".into())
+        }
+        WriteKind::Reviewers {
+            repo,
+            number,
+            add,
+            remove,
+        } => {
+            let path = format!("repos/{repo}/pulls/{number}/requested_reviewers");
+            if !add.is_empty() {
+                let body = serde_json::json!({ "reviewers": add });
+                client.rest_json("POST", &path, &body)?;
+            }
+            if !remove.is_empty() {
+                let body = serde_json::json!({ "reviewers": remove });
+                client.rest_json("DELETE", &path, &body)?;
+            }
+            Ok("review requests changed".into())
+        }
     }
+}
+
+/// The title a rename sends: the compose box's first line, trimmed.
+pub fn new_title(body: &str) -> String {
+    body.lines().next().unwrap_or_default().trim().to_owned()
 }

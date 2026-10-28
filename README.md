@@ -49,6 +49,7 @@ with where they stand, and commenters, bots included.
 | `R` `Z` (Conversation) | Reply in the selected review thread · resolve or unresolve it |
 | `Enter` (Checks) | Open the selected GitHub Actions job's log (`>` `<` jump between failures) |
 | `M` | Merge (`m` merge commit, `s` squash, `r` rebase); refused if the head moved |
+| `p` | PR actions: close or reopen, draft or ready for review, edit the title, labels, request reviewers (type to filter, `Space` checks) |
 | `w` · `b`/`←`/`Esc` | Open on the web · back to the Inbox |
 
 ### 2 Local

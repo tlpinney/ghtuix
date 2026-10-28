@@ -72,3 +72,55 @@ mutation UnresolveThread($thread: ID!) {
     }
   }
 }
+
+mutation ClosePr($pr: ID!) {
+  closePullRequest(input: { pullRequestId: $pr }) {
+    pullRequest {
+      url
+    }
+  }
+}
+
+mutation ReopenPr($pr: ID!) {
+  reopenPullRequest(input: { pullRequestId: $pr }) {
+    pullRequest {
+      url
+    }
+  }
+}
+
+mutation ToDraft($pr: ID!) {
+  convertPullRequestToDraft(input: { pullRequestId: $pr }) {
+    pullRequest {
+      url
+    }
+  }
+}
+
+mutation ReadyForReview($pr: ID!) {
+  markPullRequestReadyForReview(input: { pullRequestId: $pr }) {
+    pullRequest {
+      url
+    }
+  }
+}
+
+mutation RenamePr($pr: ID!, $title: String!) {
+  updatePullRequest(input: { pullRequestId: $pr, title: $title }) {
+    pullRequest {
+      url
+    }
+  }
+}
+
+mutation AddLabels($pr: ID!, $labels: [ID!]!) {
+  addLabelsToLabelable(input: { labelableId: $pr, labelIds: $labels }) {
+    clientMutationId
+  }
+}
+
+mutation RemoveLabels($pr: ID!, $labels: [ID!]!) {
+  removeLabelsFromLabelable(input: { labelableId: $pr, labelIds: $labels }) {
+    clientMutationId
+  }
+}

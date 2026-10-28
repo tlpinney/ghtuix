@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// The shape of what the cache stores. Bump it whenever a cached type changes meaning
 /// (a field added, a body read differently): older entries are then dropped on open.
-const FORMAT: i32 = 8;
+const FORMAT: i32 = 9;
 
 pub struct Cache {
     db: Connection,

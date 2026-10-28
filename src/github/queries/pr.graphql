@@ -29,6 +29,25 @@ query PrPage($owner: String!, $name: String!, $number: Int!) {
       mergeable
       mergeStateStatus
       reviewDecision
+      labels(first: 50) {
+        nodes {
+          id
+          name
+        }
+      }
+      reviewRequests(first: 30) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User {
+              login
+            }
+            ... on Bot {
+              login
+            }
+          }
+        }
+      }
       comments(first: 100) {
         pageInfo {
           hasNextPage

@@ -119,6 +119,13 @@ impl Compose {
             WriteKind::Commit { branch, files, .. } => {
                 format!("Commit {} staged file(s) on {branch} in", files.len())
             }
+            WriteKind::Close => "Close".into(),
+            WriteKind::Reopen => "Reopen".into(),
+            WriteKind::ToDraft => "Convert to a draft".into(),
+            WriteKind::Ready => "Mark ready for review".into(),
+            WriteKind::Title { .. } => "Rename".into(),
+            WriteKind::Labels { .. } => "Change the labels of".into(),
+            WriteKind::Reviewers { .. } => "Change the review requests of".into(),
         };
         let short = self.target.head_oid.chars().take(12).collect::<String>();
         let mut lines = vec![
@@ -157,8 +164,22 @@ impl Compose {
             WriteKind::Approve | WriteKind::RequestChanges | WriteKind::LineComment { .. }
         ) {
             lines.push(Line::raw(format!("On head commit {short}")));
+        } else if let WriteKind::Title { from } = &self.kind {
+            let to = crate::github::write::new_title(&self.editor.text());
+            lines.push(Line::raw(format!("From: {from}")));
+            lines.push(Line::raw(format!("To:   {to}")));
+        } else if let WriteKind::Labels { add, remove } = &self.kind {
+            lines.extend(add.iter().map(|l| Line::raw(format!("  + {}", l.name))));
+            lines.extend(remove.iter().map(|l| Line::raw(format!("  − {}", l.name))));
+        } else if let WriteKind::Reviewers { add, remove, .. } = &self.kind {
+            lines.extend(add.iter().map(|login| Line::raw(format!("  + @{login}"))));
+            lines.extend(
+                remove
+                    .iter()
+                    .map(|login| Line::raw(format!("  − @{login}"))),
+            );
         }
-        if self.kind.has_text() {
+        if self.kind.has_text() && !matches!(self.kind, WriteKind::Title { .. }) {
             lines.push(Line::raw(""));
             let text = self.editor.text();
             if text.trim().is_empty() {

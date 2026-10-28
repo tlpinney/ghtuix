@@ -9,6 +9,7 @@ use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
 use crate::log::LogView;
 use crate::model::{Event, MergeMethod, PrCommit, PrPage, PullRequest, WriteKind};
+use crate::picker::{Item, Picker, Purpose};
 use crate::pr::{Anchor, PrTab, PrView};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -73,6 +74,13 @@ pub enum Action {
     Merge,
     /// Pick the merge method in the merge preview.
     MergeMethod(MergeMethod),
+    /// Open the PR actions menu (close, draft, title, labels, reviewers).
+    PrMenu,
+    /// Click on row `i` of the open picker: choose it, or toggle it in a multi picker.
+    PickerRow(usize),
+    PickerToggle,
+    PickerDone,
+    PickerCancel,
     LocalTab(LocalTab),
     /// Start writing a comment or review on the open PR.
     Compose(WriteKind),
@@ -134,6 +142,11 @@ pub enum Message {
     },
     /// A write finished: the new comment's or review's URL, or why it failed.
     Written(Result<String, String>),
+    /// What a label or reviewer picker offers.
+    Choices {
+        purpose: Purpose,
+        result: Result<Vec<Item>, String>,
+    },
     /// The diff between two commits of an open PR.
     Diff {
         base: String,
@@ -167,6 +180,11 @@ pub enum Job {
     LoadPrTimeline {
         repo: String,
         number: i64,
+    },
+    /// The repository's labels or assignable users, for a picker.
+    LoadChoices {
+        repo: String,
+        purpose: Purpose,
     },
     /// Download a job's log; a finished job's log may come from the cache.
     LoadLog {
@@ -213,6 +231,8 @@ pub struct App {
     pub pr: Option<PrView>,
     /// A write being composed on the open PR.
     pub compose: Option<Compose>,
+    /// A menu or a list of labels or reviewers to choose from.
+    pub picker: Option<Picker>,
     pub local: Local,
     /// An Actions job log shown over the current view.
     pub log: Option<LogView>,
@@ -237,6 +257,7 @@ impl Default for App {
             inbox: Inbox::default(),
             pr: None,
             compose: None,
+            picker: None,
             local: Local::new(Err("No checkout yet".into())),
             log: None,
             actions: ActionsView::new(Err("No GitHub repository yet".into())),
@@ -271,6 +292,9 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if let (Some(picker), Action::Move(delta)) = (&mut self.picker, &action) {
+            return picker.move_selection(*delta);
         }
         match action {
             Action::Show(view) => {
@@ -510,6 +534,47 @@ impl App {
                     compose.kind = WriteKind::Merge { method };
                 }
             }
+            Action::PrMenu => {
+                let Some(page) = self.pr.as_ref().and_then(|pr| pr.page.as_ref()) else {
+                    self.status = "Wait for the PR to load first".into();
+                    return;
+                };
+                let mut items = Vec::new();
+                match page.state.as_str() {
+                    "open" if page.draft => items.push(Item::new("ready", "Ready for review")),
+                    "open" => items.push(Item::new("draft", "Convert to draft")),
+                    _ => {}
+                }
+                match page.state.as_str() {
+                    "open" => items.push(Item::new("close", "Close")),
+                    "closed" => items.push(Item::new("reopen", "Reopen")),
+                    _ => {}
+                }
+                items.push(Item::new("title", "Edit title"));
+                items.push(Item::new("labels", "Labels…"));
+                items.push(Item::new("reviewers", "Request reviewers…"));
+                let mut picker = Picker::new(Purpose::PrMenu, "PR actions", false);
+                picker.items = Some(Ok(items));
+                self.picker = Some(picker);
+            }
+            Action::PickerRow(row) => match &mut self.picker {
+                Some(picker) if picker.multi => picker.toggle(row),
+                Some(picker) => {
+                    picker.selected = row;
+                    self.dispatch(Action::PickerDone);
+                }
+                None => {}
+            },
+            Action::PickerToggle => {
+                if let Some(picker) = &mut self.picker
+                    && picker.multi
+                {
+                    let row = picker.selected;
+                    picker.toggle(row);
+                }
+            }
+            Action::PickerCancel => self.picker = None,
+            Action::PickerDone => self.picker_done(),
             Action::CommentLine | Action::ReplyThread | Action::ToggleResolve => {
                 if let Some(kind) = self.cursor_write(&action) {
                     self.dispatch(Action::Compose(kind));
@@ -527,7 +592,15 @@ impl App {
             }
             Action::Back => self.pr = None,
             Action::Compose(kind) => match self.pr.as_ref().and_then(|pr| pr.page.as_ref()) {
-                Some(page) => self.compose = Some(Compose::new(kind, Target::of(page))),
+                Some(page) => {
+                    let mut compose = Compose::new(kind, Target::of(page));
+                    if let WriteKind::Title { from } = &compose.kind {
+                        let from = from.clone();
+                        compose.editor.insert(&from);
+                    }
+                    self.picker = None;
+                    self.compose = Some(compose);
+                }
                 None => self.status = "Wait for the PR to load before writing".into(),
             },
             Action::ComposePreview => {
@@ -628,6 +701,106 @@ impl App {
                 }
             }
             Action::Quit => self.quit = true,
+        }
+    }
+
+    /// Acts on the open picker's choice: a menu item, or the checked labels or reviewers.
+    fn picker_done(&mut self) {
+        let Some(picker) = &self.picker else { return };
+        let Some(page) = self.pr.as_ref().and_then(|pr| pr.page.as_ref()) else {
+            self.picker = None;
+            return;
+        };
+        match picker.purpose {
+            Purpose::PrMenu => {
+                let Some(id) = picker.current().map(|item| item.id.clone()) else {
+                    return;
+                };
+                self.picker = None;
+                let kind = match id.as_str() {
+                    "close" => WriteKind::Close,
+                    "reopen" => WriteKind::Reopen,
+                    "draft" => WriteKind::ToDraft,
+                    "ready" => WriteKind::Ready,
+                    "title" => WriteKind::Title {
+                        from: page.title.clone(),
+                    },
+                    "labels" | "reviewers" => {
+                        let (purpose, title) = if id == "labels" {
+                            (Purpose::Labels, "Labels")
+                        } else {
+                            (Purpose::Reviewers, "Request reviewers")
+                        };
+                        self.jobs.push(Job::LoadChoices {
+                            repo: page.repo.clone(),
+                            purpose,
+                        });
+                        self.picker = Some(Picker::new(purpose, title, true));
+                        return;
+                    }
+                    _ => return,
+                };
+                self.dispatch(Action::Compose(kind));
+            }
+            Purpose::Labels => {
+                if picker.items.as_ref().is_none_or(|items| items.is_err()) {
+                    return;
+                }
+                let checked: Vec<&Item> = picker.checked();
+                let add: Vec<crate::model::Label> = checked
+                    .iter()
+                    .filter(|item| !page.labels.iter().any(|l| l.id == item.id))
+                    .map(|item| crate::model::Label {
+                        id: item.id.clone(),
+                        name: item.label.clone(),
+                    })
+                    .collect();
+                let remove: Vec<crate::model::Label> = page
+                    .labels
+                    .iter()
+                    .filter(|label| !checked.iter().any(|item| item.id == label.id))
+                    .cloned()
+                    .collect();
+                self.picker = None;
+                if add.is_empty() && remove.is_empty() {
+                    self.status = "The labels are unchanged".into();
+                } else {
+                    self.dispatch(Action::Compose(WriteKind::Labels { add, remove }));
+                }
+            }
+            Purpose::Reviewers => {
+                if picker.items.as_ref().is_none_or(|items| items.is_err()) {
+                    return;
+                }
+                let checked: Vec<String> = picker
+                    .checked()
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect();
+                let add: Vec<String> = checked
+                    .iter()
+                    .filter(|login| !page.requested.contains(login))
+                    .cloned()
+                    .collect();
+                let remove: Vec<String> = page
+                    .requested
+                    .iter()
+                    .filter(|login| !checked.contains(login))
+                    .cloned()
+                    .collect();
+                let (repo, number) = (page.repo.clone(), page.number);
+                self.picker = None;
+                if add.is_empty() && remove.is_empty() {
+                    self.status = "The review requests are unchanged".into();
+                } else {
+                    self.dispatch(Action::Compose(WriteKind::Reviewers {
+                        repo,
+                        number,
+                        add,
+                        remove,
+                    }));
+                }
+            }
         }
     }
 
@@ -861,6 +1034,19 @@ impl App {
                 ) {
                     self.load_actions();
                 }
+                if matches!(
+                    kind,
+                    Some(
+                        WriteKind::Close
+                            | WriteKind::Reopen
+                            | WriteKind::ToDraft
+                            | WriteKind::Ready
+                            | WriteKind::Title { .. }
+                    )
+                ) {
+                    // The Inbox shows state, drafts and titles.
+                    self.load(Job::LoadInbox);
+                }
                 if matches!(kind, Some(WriteKind::Merge { .. })) {
                     // The PR leaves the open queues and joins the merged list.
                     self.inbox.merged = Default::default();
@@ -872,6 +1058,25 @@ impl App {
                 if let Some(compose) = &mut self.compose {
                     compose.stage = Stage::Preview;
                     compose.error = Some(error);
+                }
+            }
+            Message::Choices { purpose, result } => {
+                let page = self.pr.as_ref().and_then(|pr| pr.page.as_ref());
+                if let (Some(picker), Some(page)) = (&mut self.picker, page)
+                    && picker.purpose == purpose
+                {
+                    picker.items = Some(result.map(|items| {
+                        items
+                            .into_iter()
+                            .map(|mut item| {
+                                item.checked = match purpose {
+                                    Purpose::Labels => page.labels.iter().any(|l| l.id == item.id),
+                                    _ => page.requested.contains(&item.id),
+                                };
+                                item
+                            })
+                            .collect()
+                    }));
                 }
             }
             Message::Diff { base, head, result } => {
@@ -893,6 +1098,36 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        if let Some(picker) = &mut self.picker
+            && self.compose.is_none()
+        {
+            let ctrl = key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+            let action = match key.code {
+                KeyCode::Char('c') if ctrl => Some(Action::PickerCancel),
+                KeyCode::Esc => Some(Action::PickerCancel),
+                KeyCode::Enter => Some(Action::PickerDone),
+                KeyCode::Down => Some(Action::Move(1)),
+                KeyCode::Up => Some(Action::Move(-1)),
+                KeyCode::PageDown => Some(Action::Move(10)),
+                KeyCode::PageUp => Some(Action::Move(-10)),
+                KeyCode::Char(' ') if picker.multi => Some(Action::PickerToggle),
+                KeyCode::Backspace => {
+                    picker.backspace();
+                    None
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    picker.type_char(c);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(action) = action {
+                self.dispatch(action);
+            }
+            return;
+        }
         if let Some(compose) = &mut self.compose {
             let ctrl = key
                 .modifiers
@@ -1013,6 +1248,11 @@ impl App {
                 Action::Compose(WriteKind::RequestChanges),
             ));
             controls.push(Control::new(KeyCode::Char('M'), "Merge", Action::Merge));
+            controls.push(Control::new(
+                KeyCode::Char('p'),
+                "PR actions",
+                Action::PrMenu,
+            ));
             match self.pr.as_ref().and_then(|pr| Some((pr.tab, pr.anchor()?))) {
                 Some((PrTab::Files, Anchor::Line(_))) => controls.insert(
                     0,
@@ -1147,7 +1387,10 @@ impl App {
             .map_or(String::new(), |note| format!("  •  {note}"));
         frame.render_widget(Paragraph::new(format!(" {}{note}", self.status)), status);
         hits.extend(keybar::draw(frame, bar, &self.controls()));
-        // The compose box sits over everything; only its own buttons answer clicks.
+        // A picker or the compose box sits over everything; only its own targets answer.
+        if let Some(picker) = &self.picker {
+            hits = picker.draw(frame, body);
+        }
         if let Some(compose) = &self.compose {
             let login = self.login.as_deref().unwrap_or("?");
             hits = compose.draw(frame, body, login);
@@ -1827,5 +2070,171 @@ mod tests {
         assert_eq!(app.inbox.selected, 0);
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// The picker row showing `label`, as drawn.
+    fn picker_row(app: &App, label: &str) -> usize {
+        let picker = app.picker.as_ref().unwrap();
+        let items = picker.items.as_ref().unwrap().as_ref().unwrap();
+        picker
+            .shown()
+            .iter()
+            .position(|&index| items[index].label == label)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_pr_menu_closes_a_pr_by_key_or_by_click() {
+        for by_click in [false, true] {
+            let mut app = open_pr(PrTab::Summary);
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::PrMenu);
+            } else {
+                press(&mut app, KeyCode::Char('p'));
+            }
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("PR actions"), "{screen}");
+            assert!(screen.contains("Convert to draft"), "{screen}");
+            assert!(!screen.contains("Reopen"), "an open PR offers Close only");
+            if by_click {
+                let row = picker_row(&app, "Close");
+                click(&mut app, &Action::PickerRow(row));
+            } else {
+                type_text(&mut app, "clo");
+                press(&mut app, KeyCode::Enter);
+            }
+            assert!(app.picker.is_none());
+            let screen = draw(&mut app, 140).join("\n");
+            assert!(screen.contains("Close o/a#1"), "{screen}");
+            assert!(app.jobs.is_empty(), "nothing is sent before confirming");
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(
+                &app.jobs[..],
+                [Job::Write { kind: WriteKind::Close, pr_id, .. }] if pr_id == "PR_1"
+            ));
+            app.jobs.clear();
+            app.receive(Message::Written(Ok("https://github.com/o/a/pull/1".into())));
+            assert!(app.jobs.contains(&Job::LoadInbox), "{:?}", app.jobs);
+        }
+    }
+
+    #[test]
+    fn labels_are_checked_in_a_picker_and_the_preview_shows_the_change() {
+        let mut app = open_pr(PrTab::Summary);
+        press(&mut app, KeyCode::Char('p'));
+        type_text(&mut app, "label");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.jobs,
+            vec![Job::LoadChoices {
+                repo: "o/a".into(),
+                purpose: Purpose::Labels
+            }]
+        );
+        assert!(draw(&mut app, 140).join("\n").contains("Loading…"));
+        app.receive(Message::Choices {
+            purpose: Purpose::Labels,
+            result: Ok(vec![Item::new("L_bug", "bug"), Item::new("L_wip", "wip")]),
+        });
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(screen.contains("[ ] bug"), "{screen}");
+        assert!(
+            screen.contains("[x] wip"),
+            "the PR's own label starts checked"
+        );
+        // Space toggles by key; clicking a row toggles it too.
+        press(&mut app, KeyCode::Char(' '));
+        let row = picker_row(&app, "wip");
+        click(&mut app, &Action::PickerRow(row));
+        press(&mut app, KeyCode::Enter);
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(compose.stage, Stage::Preview);
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(screen.contains("Change the labels of o/a#1"), "{screen}");
+        assert!(
+            screen.contains("+ bug") && screen.contains("− wip"),
+            "{screen}"
+        );
+        app.jobs.clear();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.jobs[..],
+            [Job::Write { kind: WriteKind::Labels { add, remove }, .. }]
+                if add[0].id == "L_bug" && remove[0].id == "L_wip"
+        ));
+    }
+
+    #[test]
+    fn reviewers_need_a_change_and_go_to_the_prs_repository() {
+        let mut app = open_pr(PrTab::Summary);
+        press(&mut app, KeyCode::Char('p'));
+        type_text(&mut app, "review");
+        press(&mut app, KeyCode::Enter);
+        app.receive(Message::Choices {
+            purpose: Purpose::Reviewers,
+            result: Ok(vec![Item::new("alice", "alice"), Item::new("bob", "bob")]),
+        });
+        // bob is already requested; Done with nothing changed sends nothing.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.compose.is_none() && app.picker.is_none());
+        assert_eq!(app.status, "The review requests are unchanged");
+        press(&mut app, KeyCode::Char('p'));
+        type_text(&mut app, "review");
+        press(&mut app, KeyCode::Enter);
+        app.receive(Message::Choices {
+            purpose: Purpose::Reviewers,
+            result: Ok(vec![Item::new("alice", "alice"), Item::new("bob", "bob")]),
+        });
+        type_text(&mut app, "ali");
+        press(&mut app, KeyCode::Char(' '));
+        draw(&mut app, 140);
+        click(&mut app, &Action::PickerDone);
+        assert!(draw(&mut app, 140).join("\n").contains("+ @alice"));
+        app.jobs.clear();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.jobs[..],
+            [Job::Write { kind: WriteKind::Reviewers { repo, number: 1, add, remove }, .. }]
+                if repo == "o/a" && add == &["alice"] && remove.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_rename_starts_from_the_title_and_previews_both() {
+        let mut app = open_pr(PrTab::Summary);
+        press(&mut app, KeyCode::Char('p'));
+        type_text(&mut app, "title");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.compose.as_ref().unwrap().editor.text(), "Change 1");
+        type_text(&mut app, "!");
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(screen.contains("From: Change 1"), "{screen}");
+        assert!(screen.contains("To:   Change 1!"), "{screen}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.jobs[..],
+            [Job::Write { kind: WriteKind::Title { from }, body, .. }]
+                if from == "Change 1" && body == "Change 1!"
+        ));
+    }
+
+    #[test]
+    fn esc_closes_the_picker_and_a_draft_offers_ready_for_review() {
+        let mut app = open_pr(PrTab::Summary);
+        app.pr.as_mut().unwrap().page.as_mut().unwrap().draft = true;
+        press(&mut app, KeyCode::Char('p'));
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(screen.contains("Ready for review"), "{screen}");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+        assert!(app.pr.is_some(), "Esc closes only the picker");
     }
 }

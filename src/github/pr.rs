@@ -2,7 +2,7 @@
 
 use super::Client;
 use crate::model::{
-    Check, Checks, Decision, Entry, FileChange, MergeMethod, Person, Stance, Thread,
+    Check, Checks, Decision, Entry, FileChange, Label, MergeMethod, Person, Stance, Thread,
 };
 use anyhow::{Result, anyhow};
 use graphql_client::GraphQLQuery;
@@ -285,6 +285,22 @@ fn convert(
     let checks = rollup
         .map(|rollup| nodes(rollup.contexts.nodes).filter_map(check).collect())
         .unwrap_or_default();
+    let labels = nodes(pr.labels.and_then(|labels| labels.nodes))
+        .map(|label| Label {
+            id: label.id,
+            name: label.name,
+        })
+        .collect();
+    let requested = nodes(pr.review_requests.and_then(|requests| requests.nodes))
+        .filter_map(|request| {
+            use PrPageRepositoryPullRequestReviewRequestsNodesRequestedReviewer as R;
+            match request.requested_reviewer? {
+                R::User(user) => Some(user.login),
+                R::Bot(bot) => Some(bot.login),
+                _ => None,
+            }
+        })
+        .collect();
     let decision = match pr.review_decision {
         Some(PullRequestReviewDecision::APPROVED) => Decision::Approved,
         Some(PullRequestReviewDecision::CHANGES_REQUESTED) => Decision::ChangesRequested,
@@ -313,6 +329,8 @@ fn convert(
         mergeable: format!("{:?}", pr.mergeable).to_lowercase(),
         merge_state: format!("{:?}", pr.merge_state_status).to_lowercase(),
         merge_methods,
+        labels,
+        requested,
         decision,
         conversation,
         threads,

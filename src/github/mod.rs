@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod actions;
 pub mod budget;
+pub mod choices;
 pub mod history;
 pub mod inbox;
 pub mod pr;
@@ -126,14 +127,48 @@ impl Client {
             .map(|_| ())
     }
 
+    /// A REST write of `method` (`POST` or `DELETE`) with a JSON body.
+    pub fn rest_json(&self, method: &str, path: &str, body: &serde_json::Value) -> Result<()> {
+        let _turn = self.gate.write_turn();
+        self.send(
+            method,
+            path,
+            "application/vnd.github+json",
+            None,
+            Some(body),
+        )
+        .map(|_| ())
+    }
+
     fn rest(&self, method: &str, path: &str, accept: &str, etag: Option<&str>) -> Result<Reply> {
+        self.send(method, path, accept, etag, None)
+    }
+
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        accept: &str,
+        etag: Option<&str>,
+        body: Option<&serde_json::Value>,
+    ) -> Result<Reply> {
         let url = format!("{}/{path}", self.rest_url);
         let _slot = self
             .gate
             .enter(crate::time::now())
             .map_err(|refused| anyhow!(refused))?;
         let auth = format!("Bearer {}", self.token);
-        let response = if method == "POST" {
+        let response = if let Some(body) = body {
+            let request = if method == "DELETE" {
+                self.agent.delete(&url).force_send_body()
+            } else {
+                self.agent.post(&url)
+            };
+            request
+                .header("Authorization", &auth)
+                .header("Accept", accept)
+                .send_json(body)
+        } else if method == "POST" {
             self.agent
                 .post(&url)
                 .header("Authorization", &auth)

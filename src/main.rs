@@ -13,6 +13,7 @@ mod local;
 mod log;
 mod markdown;
 mod model;
+mod picker;
 mod pr;
 mod time;
 
@@ -285,6 +286,28 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 number,
                 result: client()
                     .and_then(|c| github::history::commits(&c, &repo, number).map_err(text)),
+            },
+            Job::LoadChoices { repo, purpose } => Message::Choices {
+                purpose,
+                result: client().and_then(|c| {
+                    let items = match purpose {
+                        picker::Purpose::Labels => {
+                            github::choices::labels(&c, &repo).map(|labels| {
+                                labels
+                                    .into_iter()
+                                    .map(|label| picker::Item::new(label.id, label.name))
+                                    .collect()
+                            })
+                        }
+                        _ => github::choices::assignable(&c, &repo).map(|logins| {
+                            logins
+                                .into_iter()
+                                .map(|login| picker::Item::new(login.clone(), login))
+                                .collect()
+                        }),
+                    };
+                    items.map_err(text)
+                }),
             },
             Job::LoadPrTimeline { repo, number } => Message::PrTimeline {
                 number,

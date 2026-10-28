@@ -257,7 +257,20 @@ fn summary(page: &PrPage) -> Vec<Line<'static>> {
             page.author.login,
             bot(page.author.bot)
         )),
+        Line::raw(format!(
+            "State      {}{}",
+            page.state,
+            if page.draft { " (draft)" } else { "" }
+        )),
         Line::raw(format!("Branches   {} → {}", page.head_ref, page.base_ref)),
+        Line::raw(format!(
+            "Labels     {}",
+            list(page.labels.iter().map(|l| l.name.clone()))
+        )),
+        Line::raw(format!(
+            "Requested  {}",
+            list(page.requested.iter().map(|login| format!("@{login}")))
+        )),
         Line::raw(format!(
             "Changes    +{} −{} in {} files",
             page.additions, page.deletions, page.changed_files
@@ -284,6 +297,16 @@ fn summary(page: &PrPage) -> Vec<Line<'static>> {
     }
     lines.extend(crate::markdown::lines(&page.body, ""));
     lines
+}
+
+/// `a, b, c`, or `none`.
+fn list(items: impl Iterator<Item = String>) -> String {
+    let items: Vec<String> = items.collect();
+    if items.is_empty() {
+        "none".into()
+    } else {
+        items.join(", ")
+    }
 }
 
 fn entry(lines: &mut Vec<Line<'static>>, entry: &Entry, indent: &str) {
@@ -478,6 +501,11 @@ pub(crate) mod tests {
                 crate::model::MergeMethod::Merge,
                 crate::model::MergeMethod::Squash,
             ],
+            labels: vec![crate::model::Label {
+                id: "L_wip".into(),
+                name: "wip".into(),
+            }],
+            requested: vec!["bob".into()],
             decision: Decision::None,
             conversation: vec![Entry {
                 author: person("coderabbitai", true),
