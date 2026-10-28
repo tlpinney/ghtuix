@@ -44,6 +44,20 @@ search, notifications, dashboard.
 - **Plain types and small modules.** Prefer an enum and a match over a trait hierarchy;
   no task-numbered modules; refactor instead of adding a parallel version.
 
+## Caching
+
+A local SQLite database (`rusqlite`, bundled) holds what can be reused:
+
+- **Show cached, then refresh.** The last Inbox and recently opened PR pages appear
+  instantly on start; a background refresh replaces them.
+- **Skip unchanged PRs.** The Inbox search returns each PR's `updatedAt`; a cached PR page
+  with the same `updatedAt` is not fetched again.
+- **Cache immutable data forever.** Diffs between two commit SHAs and files at a commit.
+- **Conditional REST requests.** Store `ETag`s and send `If-None-Match`; GitHub answers
+  `304 Not Modified` without spending rate limit. (GraphQL has no ETags.)
+
+Cached private data is keyed by host and account, and dropped when the account changes.
+
 ## Testing
 
 - Unit tests for parsing, state transitions and layout (render into a `TestBackend`).

@@ -21,5 +21,6 @@ Read SPEC.md first. It lists the v1 features, the architecture rules and the tes
 
 ## Workflow
 
-- Work on a branch and open a PR; never push to `main` directly.
+- Commit and push straight to `main` (no PRs). Run `cargo fmt`, `cargo clippy --all-targets
+  -- -D warnings` and `cargo test` first.
 - Commit identity: the repository's default (Travis Pinney).

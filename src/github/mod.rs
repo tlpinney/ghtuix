@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use graphql_client::{GraphQLQuery, QueryBody, Response};
 use std::process::Command;
 
+pub mod inbox;
 pub mod viewer;
 
 /// A signed-in connection to one GitHub host.

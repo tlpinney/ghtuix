@@ -17,11 +17,26 @@ pub struct Control {
     pub key: KeyCode,
     pub label: &'static str,
     pub action: Action,
+    /// Drawn in the bar; a hidden control answers its key only (its own view draws it).
+    pub shown: bool,
 }
 
 impl Control {
     pub fn new(key: KeyCode, label: &'static str, action: Action) -> Self {
-        Self { key, label, action }
+        Self {
+            key,
+            label,
+            action,
+            shown: true,
+        }
+    }
+
+    /// A control drawn elsewhere (such as a tab) that the key bar only resolves.
+    pub fn hidden(key: KeyCode, action: Action) -> Self {
+        Self {
+            shown: false,
+            ..Self::new(key, "", action)
+        }
     }
 
     fn key_text(&self) -> String {
@@ -61,7 +76,7 @@ pub fn draw(frame: &mut Frame, area: Rect, controls: &[Control]) -> Vec<(Rect, A
     let mut spans = Vec::new();
     let mut hits = Vec::new();
     let mut x = area.x + 1;
-    for control in controls {
+    for control in controls.iter().filter(|control| control.shown) {
         let width = control.width();
         if x + width > area.right() {
             break;
