@@ -25,7 +25,7 @@ ghtuix
 Every control on screen is clickable and shows its key. Writes always show a preview of
 exactly what will happen and wait for **Enter** to confirm; **Esc** steps back.
 
-**Everywhere:** `1` Inbox, `2` Local, `3` Actions, `4` Notifications · `r` refresh · `q` quit ·
+**Everywhere:** `1` Inbox, `2` Local, `3` Actions, `4` Notifications, `5` Search · `r` refresh · `q` quit ·
 `↑/↓` or `j/k` move · PgUp/PgDn and the wheel scroll.
 
 ### 1 Inbox
@@ -79,6 +79,18 @@ Browsing never changes the checkout: git runs with `--no-optional-locks`, so eve
 | `Enter` / click a selected row | Open a PR notification in the PR view (Back returns here); others open on the web |
 | `x` `D` | Mark the notification read · mark it done (it leaves GitHub's inbox) |
 | `a` / `u` | Show all notifications · only unread ones |
+| `w` | Open on GitHub |
+
+### 5 Search
+
+Type [GitHub search syntax](https://docs.github.com/search-github/searching-on-github/searching-issues-and-pull-requests)
+(`is:pr is:open review-requested:@me`, `repo:owner/name label:bug`) and press **Enter**;
+**Esc** leaves the query. One request returns the first 50 issues and PRs.
+
+| Key | Action |
+| --- | --- |
+| `Enter` / click a selected row | Open a PR in the PR view (Back returns here); an issue on the web |
+| `/` or click the query | Edit the search |
 | `w` | Open on GitHub |
 
 ## Configuration

@@ -16,6 +16,7 @@ mod model;
 mod notifications;
 mod picker;
 mod pr;
+mod search;
 mod time;
 
 use anyhow::Result;
@@ -308,6 +309,10 @@ fn spawn(job: Job, host: Arc<str>, session: Session, tx: Sender<Message>) {
                 all,
                 result: client()
                     .and_then(|c| github::notifications::list(&c, all, saved).map_err(text)),
+            },
+            Job::Search(query) => Message::Search {
+                result: client().and_then(|c| github::search::search(&c, &query).map_err(text)),
+                query,
             },
             Job::LoadChoices { repo, purpose } => Message::Choices {
                 purpose,

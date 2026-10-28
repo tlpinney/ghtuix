@@ -5,6 +5,7 @@ use crate::compose::{Compose, Stage, Target};
 use crate::git::{GraphLine, Repo};
 use crate::github::actions::{Job as RunJob, Run, Saved};
 use crate::github::notifications::Notification;
+use crate::github::search::Hit;
 use crate::inbox::{Inbox, Tab};
 use crate::keybar::{self, Control};
 use crate::local::{Changes, Local, LocalTab};
@@ -13,6 +14,7 @@ use crate::model::{Event, MergeMethod, PrCommit, PrPage, PullRequest, WriteKind}
 use crate::notifications::NotificationsView;
 use crate::picker::{Item, Picker, Purpose};
 use crate::pr::{Anchor, PrTab, PrView};
+use crate::search::SearchView;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
@@ -29,14 +31,16 @@ pub enum View {
     Local,
     Actions,
     Notifications,
+    Search,
 }
 
 impl View {
-    const ALL: [(View, char, &'static str); 4] = [
+    const ALL: [(View, char, &'static str); 5] = [
         (View::Inbox, '1', "Inbox"),
         (View::Local, '2', "Local"),
         (View::Actions, '3', "Actions"),
         (View::Notifications, '4', "Notifications"),
+        (View::Search, '5', "Search"),
     ];
 }
 
@@ -78,6 +82,10 @@ pub enum Action {
     Merge,
     /// Pick the merge method in the merge preview.
     MergeMethod(MergeMethod),
+    /// Put the keys into the search query.
+    SearchEdit,
+    /// Run the typed search.
+    RunSearch,
     /// Show unread notifications only (`false`) or all of them.
     NotificationsAll(bool),
     /// Mark the selected notification read, or done.
@@ -151,6 +159,10 @@ pub enum Message {
     },
     /// A write finished: the new comment's or review's URL, or why it failed.
     Written(Result<String, String>),
+    Search {
+        query: String,
+        result: Result<(Vec<Hit>, i64), String>,
+    },
     Notifications {
         all: bool,
         result: Result<(Vec<Notification>, Option<Saved>), String>,
@@ -194,6 +206,8 @@ pub enum Job {
         repo: String,
         number: i64,
     },
+    /// Run a GitHub issue and pull request search.
+    Search(String),
     /// Notification threads; `saved` makes the read conditional.
     LoadNotifications {
         all: bool,
@@ -250,6 +264,7 @@ pub struct App {
     /// The view Back returns to from the open PR.
     pr_from: View,
     pub notifications: NotificationsView,
+    pub search: SearchView,
     /// A write being composed on the open PR.
     pub compose: Option<Compose>,
     /// A menu or a list of labels or reviewers to choose from.
@@ -279,6 +294,7 @@ impl Default for App {
             pr: None,
             pr_from: View::Inbox,
             notifications: NotificationsView::default(),
+            search: SearchView::default(),
             compose: None,
             picker: None,
             local: Local::new(Err("No checkout yet".into())),
@@ -332,6 +348,36 @@ impl App {
                     self.load_notifications();
                 }
             }
+            Action::SearchEdit => self.search.editing = true,
+            Action::RunSearch => self.run_search(),
+            Action::Select(index) if self.view == View::Search => {
+                self.search.editing = false;
+                if index == self.search.selected {
+                    self.dispatch(Action::Open);
+                } else {
+                    self.search.select(index);
+                }
+            }
+            Action::Move(delta) if self.view == View::Search => {
+                self.search.editing = false;
+                self.search.move_selection(delta);
+            }
+            Action::Open if self.view == View::Search => {
+                let Some(hit) = self.search.selected_hit().cloned() else {
+                    return;
+                };
+                if hit.pr {
+                    self.open_pr_from(hit.repo, hit.number, hit.title, hit.url);
+                } else {
+                    self.status = format!("Opening {} on the web", hit.reference());
+                    self.jobs.push(Job::Open(hit.url));
+                }
+            }
+            Action::OpenInBrowser if self.view == View::Search => {
+                if let Some(hit) = self.search.selected_hit() {
+                    self.jobs.push(Job::Open(hit.url.clone()));
+                }
+            }
             Action::NotificationsAll(all) => {
                 if self.notifications.all != all {
                     self.notifications.all = all;
@@ -357,34 +403,12 @@ impl App {
                 };
                 match item.pr_number() {
                     Some(number) => {
-                        let summary = PullRequest {
-                            repo: item.repository.full_name.clone(),
-                            number,
-                            title: item.subject.title.clone(),
-                            url: item.web_url(),
-                            body: String::new(),
-                            draft: false,
-                            author: crate::model::Person {
-                                login: String::new(),
-                                bot: false,
-                            },
-                            created_at: String::new(),
-                            updated_at: item.updated_at.clone(),
-                            merged_at: None,
-                            queues: Vec::new(),
-                            decision: crate::model::Decision::None,
-                            checks: crate::model::Checks::None,
-                            reviewers: Vec::new(),
-                        };
-                        // The notification's time is not the PR's, so no cached page answers.
-                        self.jobs.push(Job::LoadPr {
-                            repo: summary.repo.clone(),
-                            number,
-                            updated_at: None,
-                        });
-                        self.pr = Some(PrView::new(summary));
-                        self.pr_from = View::Notifications;
-                        self.view = View::Inbox;
+                        let (repo, title, url) = (
+                            item.repository.full_name.clone(),
+                            item.subject.title.clone(),
+                            item.web_url(),
+                        );
+                        self.open_pr_from(repo, number, title, url);
                     }
                     None => {
                         self.status = format!("Opening {} on the web", item.subject.title);
@@ -792,6 +816,15 @@ impl App {
                     self.load_actions();
                 } else if self.view == View::Notifications {
                     self.load_notifications();
+                } else if self.view == View::Search {
+                    // Only the last search runs again; half-typed text never does.
+                    if let Some(query) = self.search.ran.clone()
+                        && !self.search.editing
+                        && !self.search.loading
+                    {
+                        self.search.loading = true;
+                        self.jobs.push(Job::Search(query));
+                    }
                 } else if self.view == View::Inbox
                     && let Some(pr) = &mut self.pr
                 {
@@ -973,6 +1006,55 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Opens PR `repo#number` in the PR view; Back returns to the current view.
+    fn open_pr_from(&mut self, repo: String, number: i64, title: String, url: String) {
+        let summary = PullRequest {
+            repo,
+            number,
+            title,
+            url,
+            body: String::new(),
+            draft: false,
+            author: crate::model::Person {
+                login: String::new(),
+                bot: false,
+            },
+            created_at: String::new(),
+            updated_at: String::new(),
+            merged_at: None,
+            queues: Vec::new(),
+            decision: crate::model::Decision::None,
+            checks: crate::model::Checks::None,
+            reviewers: Vec::new(),
+        };
+        // Without the PR's own updatedAt, no cached page can be trusted to be current.
+        self.jobs.push(Job::LoadPr {
+            repo: summary.repo.clone(),
+            number,
+            updated_at: None,
+        });
+        self.pr = Some(PrView::new(summary));
+        self.pr_from = self.view;
+        self.view = View::Inbox;
+    }
+
+    /// Runs the typed query, unless it is empty or the same query is running.
+    fn run_search(&mut self) {
+        let query = self.search.query.trim().to_owned();
+        if query.is_empty() {
+            self.status = "Type a search first".into();
+            return;
+        }
+        if self.search.loading && self.search.ran.as_deref() == Some(query.as_str()) {
+            return;
+        }
+        self.search.loading = true;
+        self.search.editing = false;
+        self.search.selected = 0;
+        self.search.ran = Some(query.clone());
+        self.jobs.push(Job::Search(query));
     }
 
     /// Reads the notifications again, unless a read is running.
@@ -1185,6 +1267,21 @@ impl App {
                     compose.error = Some(error);
                 }
             }
+            Message::Search { query, result } => {
+                if self.search.ran.as_deref() == Some(query.as_str()) {
+                    self.search.loading = false;
+                    // Hidden repositories stay hidden here too.
+                    let hidden = &self.inbox.hidden;
+                    self.search.results = Some(result.map(|(hits, total)| {
+                        let shown = hits
+                            .into_iter()
+                            .filter(|hit| !hidden.contains(&hit.repo))
+                            .collect();
+                        (shown, total)
+                    }));
+                    self.search.move_selection(0);
+                }
+            }
             Message::Notifications { all, result } => {
                 if all == self.notifications.all {
                     self.notifications.loading = false;
@@ -1230,6 +1327,27 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        if self.view == View::Search
+            && self.search.editing
+            && self.compose.is_none()
+            && self.picker.is_none()
+            && self.log.is_none()
+        {
+            let ctrl = key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Enter => self.dispatch(Action::RunSearch),
+                KeyCode::Esc | KeyCode::Down => self.search.editing = false,
+                KeyCode::Backspace => {
+                    self.search.query.pop();
+                }
+                KeyCode::Char('u') if ctrl => self.search.query.clear(),
+                KeyCode::Char(c) if !ctrl => self.search.query.push(c),
+                _ => {}
+            }
+            return;
+        }
         if let Some(picker) = &mut self.picker
             && self.compose.is_none()
         {
@@ -1428,6 +1546,21 @@ impl App {
                     .iter()
                     .map(|(tab, key, _)| Control::hidden(KeyCode::Char(*key), Action::Tab(*tab))),
             );
+        } else if self.view == View::Search && self.search.editing {
+            // Keys type into the query; Esc leaves it. Clicks still reach every control.
+            controls.push(Control::new(KeyCode::Enter, "Search", Action::RunSearch));
+        } else if self.view == View::Search {
+            controls.push(Control::new(KeyCode::Enter, "Open", Action::Open));
+            controls.push(Control::new(
+                KeyCode::Char('/'),
+                "Edit search",
+                Action::SearchEdit,
+            ));
+            controls.push(Control::new(
+                KeyCode::Char('w'),
+                "Web",
+                Action::OpenInBrowser,
+            ));
         } else if self.view == View::Notifications {
             controls.push(Control::new(KeyCode::Enter, "Open", Action::Open));
             controls.push(Control::new(
@@ -1536,6 +1669,7 @@ impl App {
             (View::Local, None) => self.local.draw(frame, body),
             (View::Actions, None) => self.actions.draw(frame, body),
             (View::Notifications, None) => self.notifications.draw(frame, body),
+            (View::Search, None) => self.search.draw(frame, body),
         };
         let note = self
             .api_note
@@ -2525,5 +2659,127 @@ mod tests {
                 .join("\n")
                 .contains("Loading notifications")
         );
+    }
+
+    fn hit(repo: &str, number: i64, pr: bool) -> Hit {
+        Hit {
+            repo: repo.into(),
+            number,
+            title: format!("Found {number}"),
+            url: format!("https://github.com/{repo}/issues/{number}"),
+            pr,
+            state: "open".into(),
+            author: "alice".into(),
+            updated_at: "2026-10-27T10:00:00Z".into(),
+        }
+    }
+
+    fn searched() -> App {
+        let mut app = signed_in();
+        press(&mut app, KeyCode::Char('5'));
+        assert!(app.search.editing, "Search starts in its query");
+        type_text(&mut app, "is:pr q");
+        assert_eq!(
+            app.view,
+            View::Search,
+            "digits and letters type, not switch"
+        );
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.jobs, vec![Job::Search("is:pr".into())]);
+        assert!(draw(&mut app, 140).join("\n").contains("Searching…"));
+        app.receive(Message::Search {
+            query: "is:pr".into(),
+            result: Ok((
+                vec![
+                    hit("o/a", 3, true),
+                    hit("o/hidden", 4, true),
+                    hit("o/a", 5, false),
+                ],
+                120,
+            )),
+        });
+        app.jobs.clear();
+        app
+    }
+
+    #[test]
+    fn a_search_runs_on_enter_and_hides_hidden_repositories() {
+        let mut app = App::default();
+        app.inbox.hidden = vec!["o/hidden".into()];
+        app.receive(Message::SignedIn(Ok("octocat".into())));
+        app.jobs.clear();
+        press(&mut app, KeyCode::Char('5'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.jobs.is_empty(), "an empty search is not sent");
+        type_text(&mut app, "is:pr");
+        press(&mut app, KeyCode::Enter);
+        app.receive(Message::Search {
+            query: "is:pr".into(),
+            result: Ok((vec![hit("o/a", 3, true), hit("o/hidden", 4, true)], 2)),
+        });
+        let screen = draw(&mut app, 140).join("\n");
+        assert!(
+            screen.contains("o/a#3") && !screen.contains("o/hidden"),
+            "{screen}"
+        );
+        assert!(screen.contains("is:pr · 1 of 2"), "{screen}");
+    }
+
+    #[test]
+    fn a_found_pr_opens_by_key_or_click_and_back_returns_to_search() {
+        for by_click in [false, true] {
+            let mut app = searched();
+            draw(&mut app, 140);
+            if by_click {
+                click(&mut app, &Action::Select(0)); // the selected row opens
+            } else {
+                press(&mut app, KeyCode::Enter);
+            }
+            assert!(matches!(
+                &app.jobs[..],
+                [Job::LoadPr { repo, number: 3, .. }] if repo == "o/a"
+            ));
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.view, View::Search);
+            assert_eq!(app.search.ran.as_deref(), Some("is:pr"), "the results stay");
+        }
+    }
+
+    #[test]
+    fn an_issue_opens_on_the_web_and_slash_edits_the_query() {
+        let mut app = searched();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.jobs,
+            vec![Job::Open("https://github.com/o/a/issues/5".into())]
+        );
+        app.jobs.clear();
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.search.editing);
+        type_text(&mut app, "is:open");
+        draw(&mut app, 140);
+        click(&mut app, &Action::RunSearch);
+        assert_eq!(app.jobs, vec![Job::Search("is:pr is:open".into())]);
+    }
+
+    #[test]
+    fn refresh_reruns_only_the_last_search() {
+        let mut app = searched();
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, " half");
+        app.dispatch(Action::Refresh);
+        assert!(app.jobs.is_empty(), "nothing runs while typing");
+        press(&mut app, KeyCode::Esc);
+        app.dispatch(Action::Refresh);
+        assert_eq!(app.jobs, vec![Job::Search("is:pr".into())]);
+        // A late answer to an older query is ignored.
+        app.receive(Message::Search {
+            query: "older".into(),
+            result: Ok((Vec::new(), 0)),
+        });
+        assert_eq!(app.search.selected_hit().unwrap().number, 3);
     }
 }

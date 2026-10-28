@@ -15,6 +15,7 @@ pub mod history;
 pub mod inbox;
 pub mod notifications;
 pub mod pr;
+pub mod search;
 pub mod viewer;
 pub mod write;
 

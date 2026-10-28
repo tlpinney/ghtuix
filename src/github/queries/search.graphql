@@ -1,0 +1,38 @@
+# The Search view: issues and pull requests matching GitHub search syntax, one page.
+query SearchIssues($query: String!) {
+  search(query: $query, type: ISSUE, first: 50) {
+    issueCount
+    nodes {
+      __typename
+      ... on PullRequest {
+        number
+        title
+        url
+        state
+        isDraft
+        updatedAt
+        repository {
+          nameWithOwner
+        }
+        author {
+          __typename
+          login
+        }
+      }
+      ... on Issue {
+        number
+        title
+        url
+        issueState: state
+        updatedAt
+        repository {
+          nameWithOwner
+        }
+        author {
+          __typename
+          login
+        }
+      }
+    }
+  }
+}
